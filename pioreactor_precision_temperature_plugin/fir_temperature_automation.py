@@ -48,8 +48,8 @@ from pioreactor.utils import whoami
 from pioreactor.utils.networking import resolve_to_address
 from pioreactor.utils.pwm import PWM
 from pioreactor.utils.streaming_calculations import PID
-from pioreactor.utils.timing import current_utc_datetime
 from pioreactor.utils.timing import current_utc_datestamp
+from pioreactor.utils.timing import current_utc_datetime
 from pioreactor.utils.timing import current_utc_timestamp
 from pioreactor.utils.timing import RepeatedTimer
 from pioreactor.whoami import get_assigned_experiment_name
@@ -59,7 +59,9 @@ from pioreactor.whoami import get_unit_name
 
 __plugin_name__ = "fir-temperature-automation"
 __plugin_author__ = "Pioreactor"
-__plugin_summary__ = "Replaces temperature automation with FIR MLX/ambient/PCB estimation and thermostat bias trim."
+__plugin_summary__ = (
+    "Replaces temperature automation with FIR MLX/ambient/PCB estimation and thermostat bias trim."
+)
 __plugin_version__ = "0.1.0"
 
 
@@ -155,7 +157,6 @@ class TemperatureAutomationJobFIR(AutomationJob):
             "heater_duty_cycle",
             {"datatype": "float", "settable": False, "unit": "%"},
         )
-
 
         if not hardware.is_heating_pcb_present():
             self.logger.error("Heating PCB must be attached to Pioreactor HAT")
@@ -374,7 +375,9 @@ class TemperatureAutomationJobFIR(AutomationJob):
 
         return obj_temp, amb_temp
 
-    def _compute_unlagged_temperature(self, mlx_object_temp: float, mlx_ambient_temp: float, pcb_temp: float) -> float:
+    def _compute_unlagged_temperature(
+        self, mlx_object_temp: float, mlx_ambient_temp: float, pcb_temp: float
+    ) -> float:
         est = self.estimator
         volume_correction = est.k_vol * (self._volume_ml - est.volume_ref_ml)
         return (
@@ -574,7 +577,6 @@ def _load_active_fir_estimator() -> FIRTemperatureEstimator:
     if estimator_name is None:
         raise ValueError("Estimator required to be active")
 
-
     estimator_path = ESTIMATOR_PATH / TEMPERATURE_FIR_DEVICE / f"{estimator_name}.yaml"
     if not estimator_path.exists():
         raise FileNotFoundError(
@@ -666,7 +668,9 @@ def _compute_window_slope_c_per_min(history_window: list[dict[str, float]]) -> f
     return (history_window[-1]["temperature"] - history_window[0]["temperature"]) / dt_min
 
 
-def _update_stabilization_state(ctx: SessionContext, measured_temperature: float, target_temperature: float) -> None:
+def _update_stabilization_state(
+    ctx: SessionContext, measured_temperature: float, target_temperature: float
+) -> None:
     history = ctx.data.get("stability_history", [])
     if not isinstance(history, list):
         history = []
@@ -853,7 +857,9 @@ class BiasTrimProbeStep(SessionStep):
     step_id = "probe"
 
     def render(self, ctx: SessionContext):
-        estimated = float(ctx.data.get("stable_temperature_estimate", ctx.data.get("latest_estimated_temperature", 0.0)))
+        estimated = float(
+            ctx.data.get("stable_temperature_estimate", ctx.data.get("latest_estimated_temperature", 0.0))
+        )
         return steps.form(
             "Enter measured temperature",
             (

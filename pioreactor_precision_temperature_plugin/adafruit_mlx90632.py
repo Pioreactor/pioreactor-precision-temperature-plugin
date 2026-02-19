@@ -1,7 +1,7 @@
+# -*- coding: utf-8 -*-
 # SPDX-FileCopyrightText: Copyright (c) 2025 Liz Clark for Adafruit Industries
 #
 # SPDX-License-Identifier: MIT
-
 """
 Vendored MLX90632 driver for Pioreactor runtime (CPython 3.13 on Raspberry Pi Debian).
 
@@ -13,7 +13,6 @@ Pioreactor-specific assumptions:
 - Uses Blinka-provided `board.I2C()` and `busio.I2C`.
 - Uses `adafruit_bus_device.i2c_device.I2CDevice` for I2C transactions.
 """
-
 from __future__ import annotations
 
 import struct
