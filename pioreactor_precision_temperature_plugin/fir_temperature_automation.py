@@ -164,7 +164,7 @@ class TemperatureAutomationJobFIR(AutomationJob):
             raise exc.HardwareNotFoundError("Heating PCB must be attached to Pioreactor HAT")
 
         self._sample_period_s = config.getfloat("temperature_automation", "sample_period_s", fallback=1.0)
-        self._mlx_address = config.getint("temperature_automation", "mlx_address", fallback=0x3A)
+        self._mlx_address = int(config.get("temperature_automation", "mlx_address", fallback="0x3A"), 16)
 
         self.heater_duty_cycle = 0.0
         self.pwm = self.setup_pwm()
@@ -285,9 +285,9 @@ class TemperatureAutomationJobFIR(AutomationJob):
         self._update_heater(0)
         self.pwm.clean_up()
 
-        self.pwm = self.setup_pwm()
-        self.pwm.change_duty_cycle(0)
-        self.pwm.clean_up()
+        pwm = self.setup_pwm()
+        pwm.change_duty_cycle(0)
+        pwm.clean_up()
 
     def is_heater_pwm_locked(self) -> bool:
         return self.pwm.is_locked()
@@ -500,11 +500,11 @@ class Thermostat(TemperatureAutomationJobFIR):
         self.pid.set_setpoint(self.target_temperature)
 
     def execute(self):
-        while not hasattr(self, "pid"):
+        while not hasattr(self, "pid") and self.state is self.READY:
             pass
 
         assert self.latest_temperature is not None
-        output = self.pid.update(self.latest_temperature, dt=1)
+        output = self.pid.update(self.latest_temperature, dt=self._sample_period_s)
         self.update_heater_with_delta(output)
 
         return UpdatedHeaterDC(
