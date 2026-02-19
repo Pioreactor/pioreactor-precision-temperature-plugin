@@ -1,0 +1,5 @@
+recursive-include pioreactor_precision_temperature_plugin/ui *.yaml
+recursive-include pioreactor_precision_temperature_plugin/estimators *.yaml
+include pioreactor_precision_temperature_plugin/additional_config.ini
+include pioreactor_precision_temperature_plugin/post_install.sh
+include pioreactor_precision_temperature_plugin/THIRD_PARTY_LICENSE_ADAFRUIT_MLX90632.txt

@@ -1,0 +1,4 @@
+.envrc
+dist/
+build/
+pioreactor_precision_temperature_plugin.egg-info
