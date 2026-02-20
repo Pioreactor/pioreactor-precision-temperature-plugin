@@ -66,9 +66,10 @@ __plugin_version__ = "0.1.0"
 
 TEMPERATURE_FIR_DEVICE = "temperature_fir"
 
-STABILIZATION_TARGET_ERROR_C = 0.2
-STABILIZATION_MAX_SLOPE_C_PER_MIN = 0.03
-STABILIZATION_WINDOW_S = 5 * 60
+STABILIZATION_TARGET_ERROR_C = 0.1
+STABILIZATION_MAX_SLOPE_C_PER_MIN = 0.015
+STABILIZATION_WINDOW_S = 2.0 * 60
+STABILIZATION_SLOPE_SAMPLE_DELAY_S = 4.0
 STABILIZATION_TIMEOUT_S = 90 * 60
 
 available_temperature_automations: dict[str, type["TemperatureAutomationJobFIR"]] = {}
@@ -710,37 +711,41 @@ def _compute_window_slope_c_per_min(history_window: list[dict[str, float]]) -> f
 def _update_stabilization_state(
     ctx: SessionContext, measured_temperature: float, target_temperature: float
 ) -> None:
+    now_ts = _now_ts()
     history = ctx.data.get("stability_history", [])
     if not isinstance(history, list):
         history = []
 
     history.append(
         {
-            "ts": _now_ts(),
+            "ts": now_ts,
             "temperature": measured_temperature,
             "error_abs": abs(measured_temperature - target_temperature),
         }
     )
 
     # Keep up to 3h of data max.
-    earliest = _now_ts() - 3 * 3600
+    earliest = now_ts - 3 * 3600
     history = [row for row in history if row.get("ts", 0) >= earliest]
 
-    window = _windowed_history(history)
-    slope_c_per_min = _compute_window_slope_c_per_min(window)
-
-    all_errors_ok = bool(window) and all(
-        row.get("error_abs", float("inf")) <= STABILIZATION_TARGET_ERROR_C for row in window
-    )
-    has_window_span = bool(window) and (window[-1]["ts"] - window[0]["ts"] >= STABILIZATION_WINDOW_S)
-    slope_ok = math.isfinite(slope_c_per_min) and abs(slope_c_per_min) <= STABILIZATION_MAX_SLOPE_C_PER_MIN
-
-    is_stable = all_errors_ok and has_window_span and slope_ok
+    latest_abs_error = abs(measured_temperature - target_temperature)
+    error_ok = latest_abs_error <= STABILIZATION_TARGET_ERROR_C
+    slope_c_per_min = _compute_window_slope_c_per_min(history[-2:])
+    has_slope_sample = len(history) >= 2 and math.isfinite(slope_c_per_min)
+    slope_ok = has_slope_sample and (abs(slope_c_per_min) <= STABILIZATION_MAX_SLOPE_C_PER_MIN)
+    is_stable = error_ok and slope_ok
 
     ctx.data["stability_history"] = history
     ctx.data["latest_estimated_temperature"] = measured_temperature
-    ctx.data["latest_abs_error"] = abs(measured_temperature - target_temperature)
+    ctx.data["latest_abs_error"] = latest_abs_error
     ctx.data["latest_slope_c_per_min"] = slope_c_per_min
+    ctx.data["stabilization_error_ok"] = error_ok
+    ctx.data["stabilization_slope_ok"] = slope_ok
+    ctx.data["stabilization_has_slope_sample"] = has_slope_sample
+    ctx.data.pop("stabilization_span_ok", None)
+    ctx.data.pop("stabilization_window_span_s", None)
+    ctx.data.pop("stabilization_required_span_s", None)
+    ctx.data.pop("stabilization_stable_since_ts", None)
     ctx.data["is_stable"] = is_stable
 
 
@@ -841,23 +846,46 @@ class BiasTrimStabilizeStep(SessionStep):
         latest = ctx.data.get("latest_estimated_temperature")
         latest_error = ctx.data.get("latest_abs_error")
         latest_slope = ctx.data.get("latest_slope_c_per_min")
+        error_ok = ctx.data.get("stabilization_error_ok")
+        slope_ok = ctx.data.get("stabilization_slope_ok")
+        has_slope_sample = ctx.data.get("stabilization_has_slope_sample")
 
         status_lines = [
-            f"Waiting for stabilization near {target_temperature:.2f}℃.",
-            "We'll continue once the temperature has stayed close to the target and steady for about 5 minutes.",
+            f"Waiting for stabilization near {target_temperature:.2f}℃.\n",
+            # "We'll continue once the current error and short-term slope are both within strict limits.\n",
         ]
 
         if isinstance(latest, (int, float)):
-            status_lines.append(f"Latest estimate: {float(latest):.3f}℃")
+            status_lines.append(f"Latest estimate: {float(latest):.2f}℃")
         if isinstance(latest_error, (int, float)):
-            status_lines.append(f"Latest absolute error: {float(latest_error):.3f}℃")
+            status_lines.append(f"Absolute error: {float(latest_error):.2f}℃")
         if isinstance(latest_slope, (int, float)) and math.isfinite(float(latest_slope)):
-            status_lines.append(f"Latest slope: {float(latest_slope):.4f}℃/min")
+            status_lines.append(f"Rate of change: {float(latest_slope):.2f}℃/min")
+        if isinstance(error_ok, bool):
+            status_lines.append(
+                f"Error check (<= {STABILIZATION_TARGET_ERROR_C:.2f}℃): " f"{'ok' if error_ok else 'waiting'}"
+            )
+        if isinstance(slope_ok, bool):
+            slope_status = "ok" if slope_ok else "waiting"
+            if slope_ok and has_slope_sample is False:
+                slope_status = "collecting"
+            status_lines.append(
+                f"Slope check (<= {STABILIZATION_MAX_SLOPE_C_PER_MIN:.2f}℃/min): " f"{slope_status}"
+            )
 
-        if ctx.mode == "ui":
-            status_lines.append("Press Continue to check current stabilization status.")
+        status_lines.append("\nPress Continue to run a stabilization check.")
 
-        return steps.action("Stabilizing", "\n".join(status_lines))
+        step = steps.action("Stabilizing...", "\n".join(status_lines))
+
+        step.metadata = {
+            "image": {
+                "src": "/static/svgs/vial-stirbar-heated.svg",
+                "alt": "Stirring and heating.",
+                "caption": "Stirring and heating started, waiting for stabilization.",
+            }
+        }
+
+        return step
 
     def _check_once(self, ctx: SessionContext) -> bool:
         unit = str(ctx.data["unit"])
@@ -869,8 +897,14 @@ class BiasTrimStabilizeStep(SessionStep):
             return False
 
         _update_stabilization_state(ctx, reading.temperature, target)
+        time.sleep(STABILIZATION_SLOPE_SAMPLE_DELAY_S)
+        follow_up = _fetch_current_temperature(unit, experiment)
+        if follow_up is not None:
+            _update_stabilization_state(ctx, follow_up.temperature, target)
+
         if bool(ctx.data.get("is_stable", False)):
-            ctx.data["stable_temperature_estimate"] = reading.temperature
+            estimate_reading = follow_up if follow_up is not None else reading
+            ctx.data["stable_temperature_estimate"] = estimate_reading.temperature
             return True
 
         started = float(ctx.data.get("stabilization_started_at_ts", _now_ts()))
@@ -884,19 +918,10 @@ class BiasTrimStabilizeStep(SessionStep):
         return False
 
     def advance(self, ctx: SessionContext):
-        if ctx.mode == "cli":
-            while True:
-                if self._check_once(ctx):
-                    return BiasTrimProbeStep()
 
-                if ctx.session.status != "in_progress":
-                    return None
-
-                time.sleep(5)
-        else:
-            if self._check_once(ctx):
-                return BiasTrimProbeStep()
-            return BiasTrimStabilizeStep()
+        if self._check_once(ctx):
+            return BiasTrimProbeStep()
+        return BiasTrimStabilizeStep()
 
 
 class BiasTrimProbeStep(SessionStep):
@@ -934,7 +959,6 @@ class BiasTrimProbeStep(SessionStep):
             estimator_name=new_name,
             calibrated_on_pioreactor_unit=get_unit_name(),
             created_at=current_utc_datetime(),
-            model_version=base.model_version,
             w_obj=base.w_obj,
             w_amb=base.w_amb,
             w_pcb=base.w_pcb,
@@ -984,8 +1008,7 @@ class FIRTemperatureBiasTrimProtocol(CalibrationProtocol[str]):
     title = "FIR temperature one-point bias trim"
     description = "Heat to a target, stabilize, then trim a single bias against an external probe."
     requirements = (
-        "Active thermostat support from fir_temperature_automation plugin.",
-        "FIR estimator YAML seeded and active under temperature_fir.",
+        "Plugin pioreactor_precision_temperature_plugin installed.",
         "External temperature probe for the final measurement.",
     )
     step_registry = _FIR_BIAS_TRIM_STEPS
