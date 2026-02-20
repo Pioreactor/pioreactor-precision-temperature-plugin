@@ -136,20 +136,61 @@ def test_update_stabilization_state_marks_context_stable(monkeypatch: pytest.Mon
 
 
 def test_mark_failed_and_stop_sets_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    stopped_job_sources: list[str | None] = []
-    monkeypatch.setattr(
-        fta, "_stop_bias_trim_heating", lambda job_source: stopped_job_sources.append(job_source)
-    )
+    stopped_data: list[dict[str, Any]] = []
+    monkeypatch.setattr(fta, "_stop_bias_trim_jobs", lambda data: stopped_data.append(dict(data)))
 
     session = SimpleNamespace(status="in_progress", error=None, step_id="stabilize")
     ctx: Any = SimpleNamespace(data={"job_source": "abc-123"}, session=session)
 
     fta._mark_failed_and_stop(ctx, "failed to stabilize")
 
-    assert stopped_job_sources == ["abc-123"]
+    assert stopped_data == [{"job_source": "abc-123"}]
     assert session.status == "failed"
     assert session.error == "failed to stabilize"
     assert session.step_id == "ended"
+
+
+def test_on_session_abort_uses_shared_stop_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    stopped_data: list[dict[str, Any]] = []
+    monkeypatch.setattr(fta, "_stop_bias_trim_jobs", lambda data: stopped_data.append(dict(data)))
+
+    with_job_source: Any = SimpleNamespace(data={"job_source": "bias-trim-123"})
+    fta.FIRTemperatureBiasTrimProtocol.on_session_abort(with_job_source)
+
+    without_job_source: Any = SimpleNamespace(data={})
+    fta.FIRTemperatureBiasTrimProtocol.on_session_abort(without_job_source)
+
+    assert stopped_data == [
+        {"job_source": "bias-trim-123"},
+        {},
+    ]
+
+
+def test_bias_trim_target_step_starts_stirring_before_heating(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fake_start_stirring(_session_id: str) -> str:
+        calls.append("stirring")
+        return "ABC"
+
+    def fake_start_heating(_session_id: str, _target: float) -> str:
+        calls.append("heating")
+        return "ABC"
+
+    monkeypatch.setattr(fta, "_start_bias_trim_stirring", fake_start_stirring)
+    monkeypatch.setattr(fta, "_start_bias_trim_heating", fake_start_heating)
+
+    ctx: Any = SimpleNamespace(
+        data={},
+        inputs=SimpleNamespace(float=lambda _key: 37.0),
+        session=SimpleNamespace(session_id="session-123"),
+    )
+
+    next_step = fta.BiasTrimTargetStep().advance(ctx)
+
+    assert calls == ["stirring", "heating"]
+    assert ctx.data["job_source"] == "ABC"
+    assert isinstance(next_step, fta.BiasTrimStabilizeStep)
 
 
 def test_start_temperature_automation_drops_skip_first_run(monkeypatch: pytest.MonkeyPatch) -> None:

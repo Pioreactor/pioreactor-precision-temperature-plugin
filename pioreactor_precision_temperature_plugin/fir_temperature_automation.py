@@ -14,8 +14,6 @@ import time
 import typing as t
 import uuid
 from contextlib import suppress
-from datetime import datetime
-from datetime import timezone
 
 import click
 from msgspec import Meta
@@ -54,6 +52,7 @@ from pioreactor.utils.timing import current_utc_timestamp
 from pioreactor.utils.timing import RepeatedTimer
 from pioreactor.whoami import get_assigned_experiment_name
 from pioreactor.whoami import get_pioreactor_model
+from pioreactor.whoami import get_testing_experiment_name
 from pioreactor.whoami import get_unit_name
 
 
@@ -591,8 +590,7 @@ def _unit_api_address() -> str:
 
 
 def _start_bias_trim_heating(session_id: str, target_temperature: float) -> str:
-    unit = get_unit_name()
-    experiment = get_assigned_experiment_name(unit)
+    experiment = get_testing_experiment_name()
     job_source = f"fir_bias_trim_{session_id}"
 
     payload = {
@@ -621,10 +619,34 @@ def _start_bias_trim_heating(session_id: str, target_temperature: float) -> str:
     return job_source
 
 
-def _stop_bias_trim_heating(job_source: str | None) -> None:
-    if not job_source:
-        return
+def _start_bias_trim_stirring(session_id: str) -> str:
+    experiment = get_testing_experiment_name()
+    job_source = f"fir_bias_trim_{session_id}"
 
+    payload = {
+        "args": [],
+        "options": {},
+        "env": {
+            "EXPERIMENT": experiment,
+            "JOB_SOURCE": job_source,
+        },
+        "config_overrides": [],
+    }
+
+    response = post_into(
+        _unit_api_address(),
+        "/unit_api/jobs/run/job_name/stirring",
+        json=payload,
+        timeout=8,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Unable to start stirring: {response.status_code}")
+
+    return job_source
+
+
+def _stop_job_by_source(job_source: str) -> None:
     with suppress(Exception):
         post_into(
             _unit_api_address(),
@@ -632,6 +654,23 @@ def _stop_bias_trim_heating(job_source: str | None) -> None:
             json={"job_source": job_source},
             timeout=8,
         )
+
+
+def _stop_bias_trim_heating(job_source: str) -> None:
+    _stop_job_by_source(job_source)
+
+
+def _stop_bias_trim_stirring(job_source: str) -> None:
+    _stop_job_by_source(job_source)
+
+
+def _stop_bias_trim_jobs(data: t.Mapping[str, t.Any]) -> None:
+    job_source = data.get("job_source")
+    if job_source is None:
+        return
+    assert isinstance(job_source, str)
+    _stop_bias_trim_heating(job_source)
+    _stop_bias_trim_stirring(job_source)
 
 
 def _fetch_current_temperature(unit: str, experiment: str) -> structs.Temperature | None:
@@ -644,7 +683,7 @@ def _fetch_current_temperature(unit: str, experiment: str) -> structs.Temperatur
 
 
 def _now_ts() -> float:
-    return datetime.now(timezone.utc).timestamp()
+    return current_utc_datetime().timestamp()
 
 
 def _windowed_history(history: list[dict[str, float]]) -> list[dict[str, float]]:
@@ -706,7 +745,7 @@ def _update_stabilization_state(
 
 
 def _mark_failed_and_stop(ctx: SessionContext, error_message: str) -> None:
-    _stop_bias_trim_heating(ctx.data.get("job_source"))
+    _stop_bias_trim_jobs(ctx.data)
     ctx.session.status = "failed"
     ctx.session.error = error_message
     ctx.session.step_id = "ended"
@@ -731,7 +770,7 @@ def start_fir_temperature_bias_trim_session(target_device: str) -> CalibrationSe
         step_id=BiasTrimIntroStep.step_id,
         data={
             "unit": get_unit_name(),
-            "experiment": get_assigned_experiment_name(get_unit_name()),
+            "experiment": get_testing_experiment_name(),
             "started_at_ts": _now_ts(),
         },
         created_at=now,
@@ -778,7 +817,14 @@ class BiasTrimTargetStep(SessionStep):
 
         if "job_source" not in ctx.data:
             try:
-                ctx.data["job_source"] = _start_bias_trim_heating(ctx.session.session_id, target_temperature)
+                ctx.data["job_source"] = _start_bias_trim_stirring(ctx.session.session_id)
+            except Exception as e:
+                _mark_failed_and_stop(ctx, f"Unable to start stirring for bias trim: {e}")
+                return None
+
+            try:
+                js = _start_bias_trim_heating(ctx.session.session_id, target_temperature)
+                assert ctx.data["job_source"] == js
                 ctx.data["stabilization_started_at_ts"] = _now_ts()
             except Exception as e:
                 _mark_failed_and_stop(ctx, f"Unable to start thermostat for bias trim: {e}")
@@ -907,7 +953,7 @@ class BiasTrimProbeStep(SessionStep):
             _mark_failed_and_stop(ctx, f"Unable to save adjusted estimator: {e}")
             return None
         finally:
-            _stop_bias_trim_heating(ctx.data.get("job_source"))
+            _stop_bias_trim_jobs(ctx.data)
 
         ctx.complete(
             {
@@ -951,3 +997,12 @@ class FIRTemperatureBiasTrimProtocol(CalibrationProtocol[str]):
 
     def run(self, target_device: str):
         raise ValueError("Use the session flow (UI) for fir_temperature_bias_trim.")
+
+    @classmethod
+    def on_session_abort(
+        cls,
+        session: CalibrationSession,
+        executor=None,
+    ) -> None:
+        data = session.data if isinstance(session.data, dict) else {}
+        _stop_bias_trim_jobs(data)
