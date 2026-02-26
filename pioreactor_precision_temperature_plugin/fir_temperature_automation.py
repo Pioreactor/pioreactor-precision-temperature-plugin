@@ -959,8 +959,11 @@ class BiasTrimProbeStep(SessionStep):
         )
 
         try:
-            path = adjusted.save_to_disk_for_device(TEMPERATURE_FIR_DEVICE)
-            adjusted.set_as_active_calibration_for_device(TEMPERATURE_FIR_DEVICE)
+            save_result = ctx.store_estimator(adjusted, TEMPERATURE_FIR_DEVICE)
+            saved_path = save_result["path"]
+            if not isinstance(saved_path, str):
+                raise ValueError("Estimator save did not return a path.")
+            path = saved_path
         except Exception as e:
             _mark_failed_and_stop(ctx, f"Unable to save adjusted estimator: {e}")
             return None

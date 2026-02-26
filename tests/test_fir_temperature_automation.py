@@ -334,3 +334,128 @@ def test_update_heater_respects_pwm_lock() -> None:
     job.pwm = SimpleNamespace(is_locked=lambda: False)
     assert job.update_heater(50.0) is True
     assert calls == [50.0]
+
+
+def test_bias_trim_probe_step_ui_uses_store_estimator(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = SimpleNamespace(
+        estimator_name="baseline-estimator",
+        w_obj=0.6,
+        w_amb=0.2,
+        w_pcb=0.1,
+        c=1.5,
+        tau_s=5.0,
+        k_vol=0.05,
+        volume_ref_ml=25.0,
+        y="temperature_c",
+    )
+    monkeypatch.setattr(fta, "_load_active_fir_estimator", lambda: base)
+    monkeypatch.setattr(fta, "_default_bias_trim_name", lambda _name: "trimmed-estimator")
+    monkeypatch.setattr(fta, "get_unit_name", lambda: "unit-test")
+    monkeypatch.setattr(fta, "current_utc_datetime", lambda: "2020-01-01T00:00:00Z")
+
+    class FakeAdjustedEstimator:
+        def __init__(self, **kwargs) -> None:
+            self.__dict__.update(kwargs)
+
+        def save_to_disk_for_device(self, _device: str) -> str:
+            raise AssertionError("UI flow should not call direct estimator save.")
+
+        def set_as_active_calibration_for_device(self, _device: str) -> None:
+            raise AssertionError("UI flow should not directly set active estimator.")
+
+    monkeypatch.setattr(fta, "FIRTemperatureEstimator", FakeAdjustedEstimator)
+
+    stopped_data: list[dict[str, Any]] = []
+    monkeypatch.setattr(fta, "_stop_bias_trim_jobs", lambda data: stopped_data.append(dict(data)))
+
+    store_calls: list[tuple[Any, str]] = []
+    completed: dict[str, Any] = {}
+
+    def fake_store_estimator(estimator: Any, device: str) -> dict[str, str]:
+        store_calls.append((estimator, device))
+        return {
+            "device": device,
+            "estimator_name": estimator.estimator_name,
+            "path": "/tmp/ui-estimator.yaml",
+        }
+
+    ctx: Any = SimpleNamespace(
+        mode="ui",
+        data={"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"},
+        inputs=SimpleNamespace(float=lambda _key: 37.4),
+        store_estimator=fake_store_estimator,
+        complete=lambda payload: completed.update(payload),
+        session=SimpleNamespace(status="in_progress", error=None, step_id="probe"),
+    )
+
+    result = fta.BiasTrimProbeStep().advance(ctx)
+
+    assert result is None
+    assert len(store_calls) == 1
+    assert store_calls[0][1] == fta.TEMPERATURE_FIR_DEVICE
+    assert completed["saved_path"] == "/tmp/ui-estimator.yaml"
+    assert completed["estimator_name"] == "trimmed-estimator"
+    assert completed["base_estimator_name"] == "baseline-estimator"
+    assert completed["user_bias_c"] == pytest.approx(0.4)
+    assert stopped_data == [{"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"}]
+
+
+def test_bias_trim_probe_step_cli_keeps_direct_save_and_activate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = SimpleNamespace(
+        estimator_name="baseline-estimator",
+        w_obj=0.6,
+        w_amb=0.2,
+        w_pcb=0.1,
+        c=1.5,
+        tau_s=5.0,
+        k_vol=0.05,
+        volume_ref_ml=25.0,
+        y="temperature_c",
+    )
+    monkeypatch.setattr(fta, "_load_active_fir_estimator", lambda: base)
+    monkeypatch.setattr(fta, "_default_bias_trim_name", lambda _name: "trimmed-estimator")
+    monkeypatch.setattr(fta, "get_unit_name", lambda: "unit-test")
+    monkeypatch.setattr(fta, "current_utc_datetime", lambda: "2020-01-01T00:00:00Z")
+
+    calls = {"save": 0, "set_active": 0}
+
+    class FakeAdjustedEstimator:
+        def __init__(self, **kwargs) -> None:
+            self.__dict__.update(kwargs)
+
+        def save_to_disk_for_device(self, _device: str) -> str:
+            calls["save"] += 1
+            return "/tmp/cli-estimator.yaml"
+
+        def set_as_active_calibration_for_device(self, _device: str) -> None:
+            calls["set_active"] += 1
+
+    monkeypatch.setattr(fta, "FIRTemperatureEstimator", FakeAdjustedEstimator)
+
+    stopped_data: list[dict[str, Any]] = []
+    monkeypatch.setattr(fta, "_stop_bias_trim_jobs", lambda data: stopped_data.append(dict(data)))
+
+    completed: dict[str, Any] = {}
+
+    ctx: Any = SimpleNamespace(
+        mode="cli",
+        data={"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"},
+        inputs=SimpleNamespace(float=lambda _key: 37.4),
+        store_estimator=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("CLI flow should not use store_estimator.")
+        ),
+        complete=lambda payload: completed.update(payload),
+        session=SimpleNamespace(status="in_progress", error=None, step_id="probe"),
+    )
+
+    result = fta.BiasTrimProbeStep().advance(ctx)
+
+    assert result is None
+    assert calls == {"save": 1, "set_active": 1}
+    assert completed["saved_path"] == "/tmp/cli-estimator.yaml"
+    assert completed["estimator_name"] == "trimmed-estimator"
+    assert completed["base_estimator_name"] == "baseline-estimator"
+    assert completed["user_bias_c"] == pytest.approx(0.4)
+    assert stopped_data == [{"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"}]
