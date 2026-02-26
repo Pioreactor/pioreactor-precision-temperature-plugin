@@ -29,9 +29,9 @@ If `DOT_PIOREACTOR` is not set, it defaults to `$HOME/.pioreactor`.
 
 ```ini
 [temperature_automation.thermostat]
-Kp=0.03
+Kp=0.025
 Ki=0.0
-Kd=12.0
+Kd=13.0
 ```
 
 ## Vendored dependency

@@ -67,9 +67,9 @@ __plugin_version__ = "0.1.0"
 TEMPERATURE_FIR_DEVICE = "temperature_fir"
 
 STABILIZATION_TARGET_ERROR_C = 0.1
-STABILIZATION_MAX_SLOPE_C_PER_MIN = 0.015
+STABILIZATION_MAX_SLOPE_C_PER_MIN = 0.02
 STABILIZATION_WINDOW_S = 2.0 * 60
-STABILIZATION_SLOPE_SAMPLE_DELAY_S = 4.0
+STABILIZATION_SLOPE_SAMPLE_DELAY_S = 4.1
 STABILIZATION_TIMEOUT_S = 90 * 60
 
 available_temperature_automations: dict[str, type["TemperatureAutomationJobFIR"]] = {}
@@ -851,8 +851,7 @@ class BiasTrimStabilizeStep(SessionStep):
         has_slope_sample = ctx.data.get("stabilization_has_slope_sample")
 
         status_lines = [
-            f"Waiting for stabilization near {target_temperature:.2f}℃.\n",
-            # "We'll continue once the current error and short-term slope are both within strict limits.\n",
+            f"Waiting for stabilization near {target_temperature:.2f}℃. (absolute error ≤ {STABILIZATION_TARGET_ERROR_C}, and rate of change ≤ {STABILIZATION_SLOPE_SAMPLE_DELAY_S}) \n",
         ]
 
         if isinstance(latest, (int, float)):
@@ -861,17 +860,6 @@ class BiasTrimStabilizeStep(SessionStep):
             status_lines.append(f"Absolute error: {float(latest_error):.2f}℃")
         if isinstance(latest_slope, (int, float)) and math.isfinite(float(latest_slope)):
             status_lines.append(f"Rate of change: {float(latest_slope):.2f}℃/min")
-        if isinstance(error_ok, bool):
-            status_lines.append(
-                f"Error check (<= {STABILIZATION_TARGET_ERROR_C:.2f}℃): " f"{'ok' if error_ok else 'waiting'}"
-            )
-        if isinstance(slope_ok, bool):
-            slope_status = "ok" if slope_ok else "waiting"
-            if slope_ok and has_slope_sample is False:
-                slope_status = "collecting"
-            status_lines.append(
-                f"Slope check (<= {STABILIZATION_MAX_SLOPE_C_PER_MIN:.2f}℃/min): " f"{slope_status}"
-            )
 
         status_lines.append("\nPress Continue to run a stabilization check.")
 
@@ -1010,6 +998,7 @@ class FIRTemperatureBiasTrimProtocol(CalibrationProtocol[str]):
     requirements = (
         "Plugin pioreactor_precision_temperature_plugin installed.",
         "External temperature probe for the final measurement.",
+        "Vial with water or media, with a stir bar.",
     )
     step_registry = _FIR_BIAS_TRIM_STEPS
     priority = 2
