@@ -4,7 +4,8 @@ from setuptools import setup
 
 setup(
     name="pioreactor-precision-temperature-plugin",
-    version="0.2.5",
+    version="0.2.6",
+    python_requires=">=3.13,<3.14",
     license_files=("LICENSE.txt",),
     description="Precision temperature automation for Pioreactor using FIR + MLX90632",
     long_description=open("README.md").read(),

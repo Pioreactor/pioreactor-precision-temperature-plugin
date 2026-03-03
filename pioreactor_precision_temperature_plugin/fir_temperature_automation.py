@@ -168,6 +168,7 @@ class TemperatureAutomationJobFIR(AutomationJob):
 
         self.heater_duty_cycle = 0.0
         self.pwm = self.setup_pwm()
+        self._is_disconnecting = False
 
         self.heating_pcb_tmp_driver = self._setup_heating_pcb_tmp_sensor()
         self.mlx_driver = self._setup_mlx_driver(self._mlx_address)
@@ -204,6 +205,8 @@ class TemperatureAutomationJobFIR(AutomationJob):
         self.infer_temperature()
 
     def on_disconnected(self) -> None:
+        self._is_disconnecting = True
+
         with suppress(AttributeError):
             self.publish_temperature_timer.cancel()
             self.read_external_temperature_timer.cancel()
@@ -301,7 +304,12 @@ class TemperatureAutomationJobFIR(AutomationJob):
         return self.update_heater(self.heater_duty_cycle + delta_duty_cycle)
 
     def _update_heater(self, new_duty_cycle: float) -> bool:
-        self.heater_duty_cycle = clamp(0.0, round(float(new_duty_cycle), 2), 100.0)
+        requested_duty_cycle = clamp(0.0, round(float(new_duty_cycle), 2), 100.0)
+
+        if self._is_disconnecting and requested_duty_cycle > 0.0:
+            return False
+
+        self.heater_duty_cycle = requested_duty_cycle
         self.pwm.change_duty_cycle(self.heater_duty_cycle)
 
         if self.heater_duty_cycle == 0.0:
@@ -441,7 +449,7 @@ class TemperatureAutomationJobFIR(AutomationJob):
         self.latest_temperature = temperature.temperature
         self.latest_temperature_at = temperature.timestamp
 
-        if self.state == self.READY or self.state == self.INIT:
+        if not self._is_disconnecting and (self.state == self.READY or self.state == self.INIT):
             self.latest_event = self.execute()
 
     def execute(self):
