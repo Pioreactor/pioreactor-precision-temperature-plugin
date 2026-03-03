@@ -230,7 +230,7 @@ class TemperatureAutomationJobFIR(AutomationJob):
             return _MockMLX90632()
 
         try:
-            import adafruit_mlx90632  # type: ignore
+            from pioreactor_precision_temperature_plugin import adafruit_mlx90632  # type: ignore
             import board  # type: ignore
         except Exception as e:
             raise exc.HardwareNotFoundError(f"Unable to import MLX90632 dependencies: {e}")
@@ -959,6 +959,7 @@ class BiasTrimProbeStep(SessionStep):
             _mark_failed_and_stop(ctx, f"Unable to save adjusted estimator: {e}")
             return None
 
+        _stop_bias_trim_jobs(ctx.data)
         ctx.complete(
             {
                 "title": "FIR bias trim saved.",

@@ -400,7 +400,7 @@ def test_bias_trim_probe_step_ui_uses_store_estimator(monkeypatch: pytest.Monkey
     assert stopped_data == [{"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"}]
 
 
-def test_bias_trim_probe_step_cli_keeps_direct_save_and_activate(
+def test_bias_trim_probe_step_uses_store_estimator_even_if_mode_cli(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base = SimpleNamespace(
@@ -419,33 +419,31 @@ def test_bias_trim_probe_step_cli_keeps_direct_save_and_activate(
     monkeypatch.setattr(fta, "get_unit_name", lambda: "unit-test")
     monkeypatch.setattr(fta, "current_utc_datetime", lambda: "2020-01-01T00:00:00Z")
 
-    calls = {"save": 0, "set_active": 0}
-
     class FakeAdjustedEstimator:
         def __init__(self, **kwargs) -> None:
             self.__dict__.update(kwargs)
-
-        def save_to_disk_for_device(self, _device: str) -> str:
-            calls["save"] += 1
-            return "/tmp/cli-estimator.yaml"
-
-        def set_as_active_calibration_for_device(self, _device: str) -> None:
-            calls["set_active"] += 1
 
     monkeypatch.setattr(fta, "FIRTemperatureEstimator", FakeAdjustedEstimator)
 
     stopped_data: list[dict[str, Any]] = []
     monkeypatch.setattr(fta, "_stop_bias_trim_jobs", lambda data: stopped_data.append(dict(data)))
 
+    store_calls: list[tuple[Any, str]] = []
     completed: dict[str, Any] = {}
+
+    def fake_store_estimator(estimator: Any, device: str) -> dict[str, str]:
+        store_calls.append((estimator, device))
+        return {
+            "device": device,
+            "estimator_name": estimator.estimator_name,
+            "path": "/tmp/cli-estimator.yaml",
+        }
 
     ctx: Any = SimpleNamespace(
         mode="cli",
         data={"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"},
         inputs=SimpleNamespace(float=lambda _key: 37.4),
-        store_estimator=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("CLI flow should not use store_estimator.")
-        ),
+        store_estimator=fake_store_estimator,
         complete=lambda payload: completed.update(payload),
         session=SimpleNamespace(status="in_progress", error=None, step_id="probe"),
     )
@@ -453,7 +451,8 @@ def test_bias_trim_probe_step_cli_keeps_direct_save_and_activate(
     result = fta.BiasTrimProbeStep().advance(ctx)
 
     assert result is None
-    assert calls == {"save": 1, "set_active": 1}
+    assert len(store_calls) == 1
+    assert store_calls[0][1] == fta.TEMPERATURE_FIR_DEVICE
     assert completed["saved_path"] == "/tmp/cli-estimator.yaml"
     assert completed["estimator_name"] == "trimmed-estimator"
     assert completed["base_estimator_name"] == "baseline-estimator"
