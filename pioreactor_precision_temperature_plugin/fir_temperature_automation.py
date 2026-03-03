@@ -657,21 +657,12 @@ def _stop_job_by_source(job_source: str) -> None:
         )
 
 
-def _stop_bias_trim_heating(job_source: str) -> None:
-    _stop_job_by_source(job_source)
-
-
-def _stop_bias_trim_stirring(job_source: str) -> None:
-    _stop_job_by_source(job_source)
-
-
 def _stop_bias_trim_jobs(data: t.Mapping[str, t.Any]) -> None:
     job_source = data.get("job_source")
     if job_source is None:
         return
     assert isinstance(job_source, str)
-    _stop_bias_trim_heating(job_source)
-    _stop_bias_trim_stirring(job_source)
+    _stop_job_by_source(job_source)
 
 
 def _fetch_current_temperature(unit: str, experiment: str) -> structs.Temperature | None:
@@ -851,7 +842,7 @@ class BiasTrimStabilizeStep(SessionStep):
         has_slope_sample = ctx.data.get("stabilization_has_slope_sample")
 
         status_lines = [
-            f"Waiting for stabilization near {target_temperature:.2f}℃. (absolute error ≤ {STABILIZATION_TARGET_ERROR_C}, and rate of change ≤ {STABILIZATION_SLOPE_SAMPLE_DELAY_S}) \n",
+            f"Waiting for stabilization near {target_temperature:.2f}℃. (absolute error ≤ {STABILIZATION_TARGET_ERROR_C}, and rate of change ≤ {STABILIZATION_MAX_SLOPE_C_PER_MIN}) \n",
         ]
 
         if isinstance(latest, (int, float)):
@@ -967,8 +958,6 @@ class BiasTrimProbeStep(SessionStep):
         except Exception as e:
             _mark_failed_and_stop(ctx, f"Unable to save adjusted estimator: {e}")
             return None
-        finally:
-            _stop_bias_trim_jobs(ctx.data)
 
         ctx.complete(
             {
