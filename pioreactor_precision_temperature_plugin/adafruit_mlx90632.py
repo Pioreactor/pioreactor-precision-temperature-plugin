@@ -119,7 +119,8 @@ class MLX90632:
         except Exception as exc:
             raise RuntimeError(
                 "Failed to initialize MLX90632 I2C device. "
-                "Expected a Blinka-compatible I2C bus from board.I2C()."
+                f"address=0x{address:02X}, i2c_bus_type={type(i2c_bus).__name__}, "
+                f"original_error={type(exc).__name__}: {exc}"
             ) from exc
 
         # Initialize temperature history

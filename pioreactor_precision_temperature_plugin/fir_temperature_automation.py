@@ -234,11 +234,17 @@ class TemperatureAutomationJobFIR(AutomationJob):
 
         try:
             from pioreactor_precision_temperature_plugin import adafruit_mlx90632  # type: ignore
-            import board  # type: ignore
+            import busio  # type: ignore
         except Exception as e:
             raise exc.HardwareNotFoundError(f"Unable to import MLX90632 dependencies: {e}")
 
-        i2c = board.I2C()
+        if not hardware.is_i2c_device_present(address):
+            raise exc.HardwareNotFoundError(
+                f"MLX90632 not found at address 0x{address:02X} on I2C bus. "
+                "Check mlx_address and sensor wiring."
+            )
+
+        i2c = busio.I2C(hardware.get_scl_pin(), hardware.get_sda_pin())
         sensor = adafruit_mlx90632.MLX90632(i2c, address=address)
         with suppress(Exception):
             sensor.mode = adafruit_mlx90632.MODE_CONTINUOUS

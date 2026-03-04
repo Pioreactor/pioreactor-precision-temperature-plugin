@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -80,6 +81,81 @@ def test_read_mlx_resets_ready_flag_and_filters_non_finite() -> None:
 
     assert job_bad._read_mlx() is None
     assert bad_driver.reset_calls == 1
+
+
+def test_setup_mlx_driver_uses_busio_i2c(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pioreactor_precision_temperature_plugin as plugin_pkg
+
+    busio_calls: list[tuple[int, int]] = []
+
+    class FakeBusIOModule:
+        @staticmethod
+        def I2C(scl: int, sda: int) -> object:
+            busio_calls.append((scl, sda))
+            return "busio-i2c"
+
+    created: list[tuple[object, int]] = []
+
+    class FakeMLXModule:
+        MODE_CONTINUOUS = 3
+        REFRESH_1HZ = 1
+
+        class MLX90632:
+            def __init__(self, i2c_bus: object, address: int) -> None:
+                created.append((i2c_bus, address))
+                self.mode = None
+                self.refresh_rate = None
+
+    monkeypatch.setattr(fta.whoami, "is_testing_env", lambda: False)
+    monkeypatch.setattr(fta.hardware, "get_scl_pin", lambda: 11)
+    monkeypatch.setattr(fta.hardware, "get_sda_pin", lambda: 13)
+    monkeypatch.setattr(fta.hardware, "is_i2c_device_present", lambda _address: True)
+    monkeypatch.setitem(sys.modules, "busio", FakeBusIOModule())
+    monkeypatch.setattr(plugin_pkg, "adafruit_mlx90632", FakeMLXModule, raising=False)
+
+    job: Any = object.__new__(fta.TemperatureAutomationJobFIR)
+    sensor = job._setup_mlx_driver(address=0x3A)
+
+    assert busio_calls == [(11, 13)]
+    assert created == [("busio-i2c", 0x3A)]
+    assert sensor.mode == FakeMLXModule.MODE_CONTINUOUS
+    assert sensor.refresh_rate == FakeMLXModule.REFRESH_1HZ
+
+
+def test_setup_mlx_driver_raises_clear_error_when_address_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pioreactor_precision_temperature_plugin as plugin_pkg
+    from pioreactor import exc as pr_exc
+
+    class FakeBusIOModule:
+        @staticmethod
+        def I2C(_scl: int, _sda: int) -> object:
+            return object()
+
+    class FakeMLXModule:
+        MODE_CONTINUOUS = 3
+        REFRESH_1HZ = 1
+
+        class MLX90632:
+            def __init__(self, _i2c_bus: object, _address: int) -> None:
+                raise AssertionError("should not attempt MLX init when address is missing")
+
+    monkeypatch.setattr(fta.whoami, "is_testing_env", lambda: False)
+    monkeypatch.setattr(fta.hardware, "get_scl_pin", lambda: 11)
+    monkeypatch.setattr(fta.hardware, "get_sda_pin", lambda: 13)
+    monkeypatch.setattr(fta.hardware, "is_i2c_device_present", lambda _address: False)
+    monkeypatch.setitem(sys.modules, "busio", FakeBusIOModule())
+    monkeypatch.setattr(plugin_pkg, "adafruit_mlx90632", FakeMLXModule, raising=False)
+
+    job: Any = object.__new__(fta.TemperatureAutomationJobFIR)
+
+    with pytest.raises(pr_exc.HardwareNotFoundError) as e:
+        job._setup_mlx_driver(address=0x3A)
+
+    assert "MLX90632 not found at address 0x3A" in str(e.value)
 
 
 def test_update_volume_from_mqtt_ignores_invalid_payloads() -> None:
