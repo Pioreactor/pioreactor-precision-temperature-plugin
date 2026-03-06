@@ -412,6 +412,36 @@ def test_update_heater_respects_pwm_lock() -> None:
     assert calls == [50.0]
 
 
+def test_check_if_exceeds_max_temp_reduces_heater_gently_in_danger_zone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fta,
+        "get_pioreactor_model",
+        lambda: SimpleNamespace(
+            max_temp_to_reduce_heating=50.0,
+            max_temp_to_disable_heating=60.0,
+            max_temp_to_shutdown=70.0,
+        ),
+    )
+
+    job: Any = object.__new__(fta.TemperatureAutomationJobFIR)
+    job.heater_duty_cycle = 80.0
+    job.logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
+    reductions: list[float] = []
+
+    def fake_update_heater(new_dc: float) -> bool:
+        reductions.append(new_dc)
+        return True
+
+    job._update_heater = fake_update_heater
+
+    observed_temp = job._check_if_exceeds_max_temp(55.0)
+
+    assert observed_temp == pytest.approx(55.0)
+    assert reductions == [pytest.approx(80.0 * fta.DANGER_ZONE_DUTY_CYCLE_REDUCTION_FACTOR)]
+
+
 def test_bias_trim_probe_step_ui_uses_store_estimator(monkeypatch: pytest.MonkeyPatch) -> None:
     base = SimpleNamespace(
         estimator_name="baseline-estimator",

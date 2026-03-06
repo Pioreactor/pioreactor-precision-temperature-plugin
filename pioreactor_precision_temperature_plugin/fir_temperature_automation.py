@@ -71,6 +71,7 @@ STABILIZATION_MAX_SLOPE_C_PER_MIN = 0.02
 STABILIZATION_WINDOW_S = 2.0 * 60
 STABILIZATION_SLOPE_SAMPLE_DELAY_S = 4.1
 STABILIZATION_TIMEOUT_S = 90 * 60
+DANGER_ZONE_DUTY_CYCLE_REDUCTION_FACTOR = 0.9965
 
 available_temperature_automations: dict[str, type["TemperatureAutomationJobFIR"]] = {}
 
@@ -365,9 +366,9 @@ class TemperatureAutomationJobFIR(AutomationJob):
 
         elif temp > self.MAX_TEMP_TO_REDUCE_HEATING:
             self.logger.debug(
-                f"Temperature of heating surface exceeded {self.MAX_TEMP_TO_REDUCE_HEATING}℃ (currently {temp}℃). Reducing heater by 10%."
+                f"Temperature of heating surface exceeded {self.MAX_TEMP_TO_REDUCE_HEATING}℃ (currently {temp}℃). Reducing heater slightly."
             )
-            self._update_heater(self.heater_duty_cycle * 0.9)
+            self._update_heater(self.heater_duty_cycle * DANGER_ZONE_DUTY_CYCLE_REDUCTION_FACTOR)
 
         return temp
 
