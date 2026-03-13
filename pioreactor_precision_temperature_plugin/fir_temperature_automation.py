@@ -180,7 +180,10 @@ class TemperatureAutomationJobFIR(AutomationJob):
 
         self.subscribe_and_callback(
             self._update_volume_from_mqtt,
-            f"pioreactor/{self.unit}/{self.experiment}/dosing_automation/current_volume_ml",
+            [
+                f"pioreactor/{self.unit}/{self.experiment}/dosing_automation/current_volume_ml",
+                f"pioreactor/{self.unit}/{self.experiment}/bioreactor/current_volume_ml",
+            ],
             allow_retained=True,
         )
 
