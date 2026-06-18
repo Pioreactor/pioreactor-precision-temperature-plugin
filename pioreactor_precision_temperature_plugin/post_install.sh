@@ -21,5 +21,3 @@ else
   echo "pio command not found. Run this manually:"
   echo "  pio estimators set-active --device temperature_fir --name $ESTIMATOR_NAME"
 fi
-
-sudo systemctl restart pioreactor-web.target || true

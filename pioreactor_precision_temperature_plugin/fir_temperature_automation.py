@@ -10,6 +10,7 @@ sample_period_s=1.0
 from __future__ import annotations
 
 import math
+import statistics
 import time
 import typing as t
 import uuid
@@ -68,8 +69,10 @@ TEMPERATURE_FIR_DEVICE = "temperature_fir"
 
 STABILIZATION_TARGET_ERROR_C = 0.1
 STABILIZATION_MAX_SLOPE_C_PER_MIN = 0.02
-STABILIZATION_WINDOW_S = 2.0 * 60
-STABILIZATION_SLOPE_SAMPLE_DELAY_S = 4.1
+STABILIZATION_WINDOW_S = 30.0
+STABILIZATION_SAMPLE_INTERVAL_S = 5.0
+STABILIZATION_MAX_RANGE_C = 0.08
+STABILIZATION_RISING_UPPER_HEADROOM_C = 0.03
 STABILIZATION_TIMEOUT_S = 90 * 60
 DANGER_ZONE_DUTY_CYCLE_REDUCTION_FACTOR = 0.9965
 
@@ -314,6 +317,10 @@ class TemperatureAutomationJobFIR(AutomationJob):
         return self.update_heater(self.heater_duty_cycle + delta_duty_cycle)
 
     def _update_heater(self, new_duty_cycle: float) -> bool:
+
+        if self.pwm._is_cleaned_up:
+            return False
+
         requested_duty_cycle = clamp(0.0, round(float(new_duty_cycle), 2), 100.0)
 
         if self._is_disconnecting and requested_duty_cycle > 0.0:
@@ -696,65 +703,64 @@ def _now_ts() -> float:
     return current_utc_datetime().timestamp()
 
 
-def _windowed_history(history: list[dict[str, float]]) -> list[dict[str, float]]:
-    if not history:
-        return []
-
-    newest = history[-1]["ts"]
-    min_ts = newest - STABILIZATION_WINDOW_S
-    return [row for row in history if row["ts"] >= min_ts]
-
-
 def _compute_window_slope_c_per_min(history_window: list[dict[str, float]]) -> float:
     if len(history_window) < 2:
         return float("inf")
 
-    dt_s = history_window[-1]["ts"] - history_window[0]["ts"]
-    if dt_s <= 0:
+    mean_ts = sum(row["ts"] for row in history_window) / len(history_window)
+    mean_temperature = sum(row["temperature"] for row in history_window) / len(history_window)
+    variance_ts = sum((row["ts"] - mean_ts) ** 2 for row in history_window)
+    if variance_ts <= 0:
         return float("inf")
 
-    dt_min = dt_s / 60.0
-    return (history_window[-1]["temperature"] - history_window[0]["temperature"]) / dt_min
+    covariance = sum(
+        (row["ts"] - mean_ts) * (row["temperature"] - mean_temperature) for row in history_window
+    )
+    return (covariance / variance_ts) * 60.0
 
 
 def _update_stabilization_state(
-    ctx: SessionContext, measured_temperature: float, target_temperature: float
+    ctx: SessionContext, history: list[dict[str, float]], target_temperature: float
 ) -> None:
-    now_ts = _now_ts()
-    history = ctx.data.get("stability_history", [])
-    if not isinstance(history, list):
-        history = []
-
-    history.append(
-        {
-            "ts": now_ts,
-            "temperature": measured_temperature,
-            "error_abs": abs(measured_temperature - target_temperature),
-        }
+    temperatures = [row["temperature"] for row in history]
+    latest_temperature = temperatures[-1]
+    latest_abs_error = abs(latest_temperature - target_temperature)
+    slope_c_per_min = _compute_window_slope_c_per_min(history)
+    all_errors_ok = all(
+        abs(temperature - target_temperature) <= STABILIZATION_TARGET_ERROR_C for temperature in temperatures
     )
+    slope_ok = math.isfinite(slope_c_per_min) and abs(slope_c_per_min) <= STABILIZATION_MAX_SLOPE_C_PER_MIN
+    window_range_c = max(temperatures) - min(temperatures)
+    range_ok = window_range_c <= STABILIZATION_MAX_RANGE_C
+    upper_headroom_ok = not (
+        slope_c_per_min > 0
+        and latest_temperature > target_temperature + STABILIZATION_RISING_UPPER_HEADROOM_C
+    )
+    is_stable = all_errors_ok and slope_ok and range_ok and upper_headroom_ok
 
-    # Keep up to 3h of data max.
-    earliest = now_ts - 3 * 3600
-    history = [row for row in history if row.get("ts", 0) >= earliest]
-
-    latest_abs_error = abs(measured_temperature - target_temperature)
-    error_ok = latest_abs_error <= STABILIZATION_TARGET_ERROR_C
-    slope_c_per_min = _compute_window_slope_c_per_min(history[-2:])
-    has_slope_sample = len(history) >= 2 and math.isfinite(slope_c_per_min)
-    slope_ok = has_slope_sample and (abs(slope_c_per_min) <= STABILIZATION_MAX_SLOPE_C_PER_MIN)
-    is_stable = error_ok and slope_ok
+    if is_stable:
+        status_message = "Temperature passed the 30-second stability check."
+    elif not upper_headroom_ok:
+        status_message = "Temperature is still rising near the upper limit. Wait before checking again."
+    elif latest_temperature > target_temperature + STABILIZATION_TARGET_ERROR_C:
+        status_message = "Temperature is above the target. Wait for it to return before checking again."
+    elif not range_ok:
+        status_message = "Temperature is near the target but still varying. Wait before checking again."
+    elif slope_c_per_min > STABILIZATION_MAX_SLOPE_C_PER_MIN:
+        status_message = "Temperature is still warming. Wait before checking again."
+    else:
+        status_message = "Temperature is not yet within the target range. Wait before checking again."
 
     ctx.data["stability_history"] = history
-    ctx.data["latest_estimated_temperature"] = measured_temperature
+    ctx.data["latest_estimated_temperature"] = latest_temperature
     ctx.data["latest_abs_error"] = latest_abs_error
     ctx.data["latest_slope_c_per_min"] = slope_c_per_min
-    ctx.data["stabilization_error_ok"] = error_ok
+    ctx.data["stabilization_error_ok"] = all_errors_ok
     ctx.data["stabilization_slope_ok"] = slope_ok
-    ctx.data["stabilization_has_slope_sample"] = has_slope_sample
-    ctx.data.pop("stabilization_span_ok", None)
-    ctx.data.pop("stabilization_window_span_s", None)
-    ctx.data.pop("stabilization_required_span_s", None)
-    ctx.data.pop("stabilization_stable_since_ts", None)
+    ctx.data["stabilization_range_ok"] = range_ok
+    ctx.data["stabilization_upper_headroom_ok"] = upper_headroom_ok
+    ctx.data["stabilization_window_range_c"] = window_range_c
+    ctx.data["stabilization_status_message"] = status_message
     ctx.data["is_stable"] = is_stable
 
 
@@ -855,14 +861,14 @@ class BiasTrimStabilizeStep(SessionStep):
         latest = ctx.data.get("latest_estimated_temperature")
         latest_error = ctx.data.get("latest_abs_error")
         latest_slope = ctx.data.get("latest_slope_c_per_min")
-        error_ok = ctx.data.get("stabilization_error_ok")
-        slope_ok = ctx.data.get("stabilization_slope_ok")
-        has_slope_sample = ctx.data.get("stabilization_has_slope_sample")
+        status_message = ctx.data.get("stabilization_status_message")
 
         status_lines = [
-            f"Waiting for stabilization near {target_temperature:.2f}℃. (absolute error ≤ {STABILIZATION_TARGET_ERROR_C}, and rate of change ≤ {STABILIZATION_MAX_SLOPE_C_PER_MIN}) \n",
+            f"Waiting for stabilization near {target_temperature:.2f}℃. Each check takes about 30 seconds.",
         ]
 
+        if isinstance(status_message, str):
+            status_lines.append(f"\n{status_message}")
         if isinstance(latest, (int, float)):
             status_lines.append(f"Latest estimate: {float(latest):.2f}℃")
         if isinstance(latest_error, (int, float)):
@@ -891,21 +897,31 @@ class BiasTrimStabilizeStep(SessionStep):
 
         reading = _fetch_current_temperature(unit, experiment)
         if reading is None:
+            ctx.data["stabilization_status_message"] = (
+                "No temperature reading was available. Check the sensor and try again."
+            )
             return False
 
-        _update_stabilization_state(ctx, reading.temperature, target)
-        time.sleep(STABILIZATION_SLOPE_SAMPLE_DELAY_S)
-        follow_up = _fetch_current_temperature(unit, experiment)
-        if follow_up is not None:
-            _update_stabilization_state(ctx, follow_up.temperature, target)
+        history = [{"ts": _now_ts(), "temperature": reading.temperature}]
+        sample_count = round(STABILIZATION_WINDOW_S / STABILIZATION_SAMPLE_INTERVAL_S)
+        for _ in range(sample_count):
+            time.sleep(STABILIZATION_SAMPLE_INTERVAL_S)
+            reading = _fetch_current_temperature(unit, experiment)
+            if reading is None:
+                ctx.data["stabilization_status_message"] = (
+                    "A temperature reading was missed during the check. Try again."
+                )
+                return False
+            history.append({"ts": _now_ts(), "temperature": reading.temperature})
 
+        _update_stabilization_state(ctx, history, target)
         if bool(ctx.data.get("is_stable", False)):
-            estimate_reading = follow_up if follow_up is not None else reading
-            ctx.data["stable_temperature_estimate"] = estimate_reading.temperature
+            ctx.data["stable_temperature_estimate"] = statistics.median(row["temperature"] for row in history)
             return True
 
-        started = float(ctx.data.get("stabilization_started_at_ts", _now_ts()))
-        if (_now_ts() - started) > STABILIZATION_TIMEOUT_S:
+        started_at = ctx.data.get("stabilization_started_at_ts")
+        started = float(started_at) if isinstance(started_at, (int, float)) else _now_ts()
+        if (history[-1]["ts"] - started) > STABILIZATION_TIMEOUT_S:
             _mark_failed_and_stop(
                 ctx,
                 "Timed out waiting for stabilization (90 minutes). Consider adjusting target temperature and retrying.",

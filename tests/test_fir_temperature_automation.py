@@ -173,95 +173,35 @@ def test_update_volume_from_mqtt_ignores_invalid_payloads() -> None:
     assert job._volume_ml == pytest.approx(31.5)
 
 
-def test_windowed_history_and_slope() -> None:
-    in_window_start_ts = 600.0 - fta.STABILIZATION_WINDOW_S + 10.0
+def test_compute_window_slope_returns_endpoint_slope_for_linear_history() -> None:
     history = [
-        {"ts": 100.0, "temperature": 30.0},
-        {"ts": in_window_start_ts, "temperature": 33.0},
-        {"ts": 600.0, "temperature": 38.0},
-    ]
-    window = fta._windowed_history(history)
-
-    assert window == [
-        {"ts": in_window_start_ts, "temperature": 33.0},
+        {"ts": 540.0, "temperature": 33.0},
+        {"ts": 570.0, "temperature": 35.5},
         {"ts": 600.0, "temperature": 38.0},
     ]
 
-    slope = fta._compute_window_slope_c_per_min(window)
-    expected = (38.0 - 33.0) / ((600.0 - in_window_start_ts) / 60.0)
+    slope = fta._compute_window_slope_c_per_min(history)
+    expected = (38.0 - 33.0) / ((600.0 - 540.0) / 60.0)
     assert slope == pytest.approx(expected)
     assert math.isinf(fta._compute_window_slope_c_per_min([]))
 
 
-def test_update_stabilization_state_marks_context_stable(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = 1000.0
-    ctx: Any = SimpleNamespace(
-        data={
-            "stability_history": [
-                {"ts": now - 5.0, "temperature": 37.00, "error_abs": 0.00},
-            ]
-        }
-    )
-    monkeypatch.setattr(fta, "_now_ts", lambda: now)
+def test_compute_window_slope_uses_linear_regression() -> None:
+    history = [
+        {"ts": 0.0, "temperature": 36.99},
+        {"ts": 10.0, "temperature": 37.02},
+        {"ts": 20.0, "temperature": 37.01},
+        {"ts": 30.0, "temperature": 37.02},
+    ]
 
-    fta._update_stabilization_state(ctx, measured_temperature=37.0005, target_temperature=37.0)
-
-    assert bool(ctx.data["is_stable"]) is True
-    assert bool(ctx.data["stabilization_error_ok"]) is True
-    assert bool(ctx.data["stabilization_slope_ok"]) is True
-    assert bool(ctx.data["stabilization_has_slope_sample"]) is True
-    assert ctx.data["latest_estimated_temperature"] == pytest.approx(37.0005)
-    assert ctx.data["latest_abs_error"] == pytest.approx(0.0005)
-    assert abs(float(ctx.data["latest_slope_c_per_min"])) <= fta.STABILIZATION_MAX_SLOPE_C_PER_MIN
-    assert "stabilization_span_ok" not in ctx.data
-    assert "stabilization_stable_since_ts" not in ctx.data
+    assert fta._compute_window_slope_c_per_min(history) == pytest.approx(0.048)
 
 
-def test_update_stabilization_state_requires_two_samples_for_slope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = 1000.0
-    ctx: Any = SimpleNamespace(data={})
-    monkeypatch.setattr(fta, "_now_ts", lambda: now)
-
-    fta._update_stabilization_state(ctx, measured_temperature=37.00, target_temperature=37.0)
-
-    assert bool(ctx.data["stabilization_error_ok"]) is True
-    assert bool(ctx.data["stabilization_slope_ok"]) is False
-    assert bool(ctx.data["stabilization_has_slope_sample"]) is False
-    assert bool(ctx.data["is_stable"]) is False
-    assert math.isinf(float(ctx.data["latest_slope_c_per_min"]))
-
-
-def test_update_stabilization_state_marks_not_stable_when_error_out_of_bounds(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = 1000.0
-    ctx: Any = SimpleNamespace(
-        data={
-            "stability_history": [
-                {"ts": 940.0, "temperature": 37.00, "error_abs": 0.00},
-            ],
-            "stabilization_stable_since_ts": 700.0,
-        }
-    )
-    monkeypatch.setattr(fta, "_now_ts", lambda: now)
-
-    fta._update_stabilization_state(ctx, measured_temperature=37.30, target_temperature=37.0)
-
-    assert bool(ctx.data["stabilization_error_ok"]) is False
-    assert bool(ctx.data["is_stable"]) is False
-
-
-def test_check_once_collects_two_samples_in_one_click(monkeypatch: pytest.MonkeyPatch) -> None:
-    readings = iter(
-        [
-            SimpleNamespace(temperature=37.00),
-            SimpleNamespace(temperature=37.0005),
-        ]
-    )
+def test_check_once_accepts_stable_window_and_uses_median(monkeypatch: pytest.MonkeyPatch) -> None:
+    temperatures = [37.00, 37.01, 37.00, 37.02, 37.01, 37.00, 37.01]
+    readings = iter(SimpleNamespace(temperature=value) for value in temperatures)
     sleep_calls: list[float] = []
-    now_values = iter([1000.0, 1005.0])
+    now_values = iter(1000.0 + index * 5.0 for index in range(len(temperatures)))
 
     monkeypatch.setattr(fta, "_fetch_current_temperature", lambda *_args, **_kwargs: next(readings, None))
     monkeypatch.setattr(fta.time, "sleep", lambda seconds: sleep_calls.append(seconds))
@@ -282,23 +222,81 @@ def test_check_once_collects_two_samples_in_one_click(monkeypatch: pytest.Monkey
     result = fta.BiasTrimStabilizeStep()._check_once(ctx)
 
     assert result is True
-    assert sleep_calls == [fta.STABILIZATION_SLOPE_SAMPLE_DELAY_S]
-    assert float(ctx.data["stable_temperature_estimate"]) == pytest.approx(37.0005)
+    assert sleep_calls == [fta.STABILIZATION_SAMPLE_INTERVAL_S] * 6
+    assert float(ctx.data["stable_temperature_estimate"]) == pytest.approx(37.01)
+    assert float(ctx.data["stabilization_window_range_c"]) == pytest.approx(0.02)
 
 
-def test_update_stabilization_state_first_reading_marks_slope_collecting(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = 1000.0
-    ctx: Any = SimpleNamespace(data={})
-    monkeypatch.setattr(fta, "_now_ts", lambda: now)
+def test_check_once_accepts_flat_window_with_moderate_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
+    temperatures = [36.97, 37.04, 36.98, 37.035, 36.98, 37.04, 36.97]
+    readings = iter(SimpleNamespace(temperature=value) for value in temperatures)
+    now_values = iter(1000.0 + index * 5.0 for index in range(len(temperatures)))
 
-    fta._update_stabilization_state(ctx, measured_temperature=37.00, target_temperature=37.0)
+    monkeypatch.setattr(fta, "_fetch_current_temperature", lambda *_args, **_kwargs: next(readings, None))
+    monkeypatch.setattr(fta.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(fta, "_now_ts", lambda: next(now_values))
 
-    assert bool(ctx.data["stabilization_error_ok"]) is True
-    assert bool(ctx.data["stabilization_slope_ok"]) is False
-    assert bool(ctx.data["stabilization_has_slope_sample"]) is False
-    assert bool(ctx.data["is_stable"]) is False
+    ctx: Any = SimpleNamespace(
+        data={
+            "unit": "unit-test",
+            "experiment": "exp-test",
+            "target_temperature": 37.0,
+            "stabilization_started_at_ts": 900.0,
+        },
+        session=SimpleNamespace(status="in_progress", error=None, step_id="stabilize"),
+    )
+
+    assert fta.BiasTrimStabilizeStep()._check_once(ctx) is True
+    assert bool(ctx.data["stabilization_range_ok"]) is True
+    assert float(ctx.data["stabilization_window_range_c"]) == pytest.approx(0.07)
+
+
+def test_check_once_rejects_rising_window_near_upper_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    temperatures = [37.02, 37.03, 37.04, 37.05, 37.06, 37.07, 37.08]
+    readings = iter(SimpleNamespace(temperature=value) for value in temperatures)
+    now_values = iter(1000.0 + index * 5.0 for index in range(len(temperatures)))
+
+    monkeypatch.setattr(fta, "_fetch_current_temperature", lambda *_args, **_kwargs: next(readings, None))
+    monkeypatch.setattr(fta.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(fta, "_now_ts", lambda: next(now_values))
+
+    ctx: Any = SimpleNamespace(
+        data={
+            "unit": "unit-test",
+            "experiment": "exp-test",
+            "target_temperature": 37.0,
+            "stabilization_started_at_ts": 900.0,
+        },
+        session=SimpleNamespace(status="in_progress", error=None, step_id="stabilize"),
+    )
+
+    assert fta.BiasTrimStabilizeStep()._check_once(ctx) is False
+    assert bool(ctx.data["stabilization_upper_headroom_ok"]) is False
+    assert "rising" in str(ctx.data["stabilization_status_message"]).lower()
+
+
+def test_check_once_rejects_excessive_window_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    temperatures = [36.95, 37.04, 36.96, 37.03, 36.97, 37.02, 36.98]
+    readings = iter(SimpleNamespace(temperature=value) for value in temperatures)
+    now_values = iter(1000.0 + index * 5.0 for index in range(len(temperatures)))
+
+    monkeypatch.setattr(fta, "_fetch_current_temperature", lambda *_args, **_kwargs: next(readings, None))
+    monkeypatch.setattr(fta.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(fta, "_now_ts", lambda: next(now_values))
+
+    ctx: Any = SimpleNamespace(
+        data={
+            "unit": "unit-test",
+            "experiment": "exp-test",
+            "target_temperature": 37.0,
+            "stabilization_started_at_ts": 900.0,
+        },
+        session=SimpleNamespace(status="in_progress", error=None, step_id="stabilize"),
+    )
+
+    assert fta.BiasTrimStabilizeStep()._check_once(ctx) is False
+    assert bool(ctx.data["stabilization_range_ok"]) is False
+    assert "varying" in str(ctx.data["stabilization_status_message"]).lower()
 
 
 def test_mark_failed_and_stop_sets_session_state(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -22,6 +22,10 @@ def _write_test_config(dot_pioreactor: Path) -> None:
 
             [mqtt]
             broker_address=localhost
+            broker_port=1883
+            use_tls=0
+            username=pioreactor
+            password=raspberry
 
             [logging]
             log_file={logs_dir / "pioreactor.log"}
