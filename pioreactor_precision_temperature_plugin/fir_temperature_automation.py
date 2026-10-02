@@ -62,7 +62,7 @@ __plugin_author__ = "Pioreactor"
 __plugin_summary__ = (
     "Replaces temperature automation with FIR MLX/ambient/PCB estimation and thermostat bias trim."
 )
-__plugin_version__ = "0.1.0"
+__plugin_version__ = "0.2.12"
 
 
 TEMPERATURE_FIR_DEVICE = "temperature_fir"

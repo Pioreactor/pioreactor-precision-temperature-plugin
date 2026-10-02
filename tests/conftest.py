@@ -34,6 +34,10 @@ def _write_test_config(dot_pioreactor: Path) -> None:
 
             [stirring.config]
             initial_target_rpm=400
+
+            [od_config.photodiode_channel]
+            1=REF
+            2=90
             """
         ).strip()
     )
@@ -60,6 +64,9 @@ def _install_runtime_stubs() -> None:
 
         rpi_hardware_pwm.HardwarePWM = HardwarePWM  # type: ignore[attr-defined]
         sys.modules["rpi_hardware_pwm"] = rpi_hardware_pwm
+
+    # Load the self-test registry before replacing the calibration API below.
+    import pioreactor.actions.self_test  # noqa: F401
 
     # The installed pioreactor build imports calibration protocols eagerly, which
     # pulls in modules unrelated to this plugin's unit tests. Stub only the small
