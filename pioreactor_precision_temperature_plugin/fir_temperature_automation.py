@@ -15,18 +15,20 @@ import time
 import typing as t
 import uuid
 from contextlib import suppress
+from threading import Event
+from threading import RLock
 
 import click
 from msgspec import Meta
 from msgspec.json import decode as json_decode
 from msgspec.yaml import decode as yaml_decode
+from pioreactor import bioreactor
 from pioreactor import error_codes
 from pioreactor import exc
 from pioreactor import hardware
 from pioreactor import structs
 from pioreactor import types as pt
 from pioreactor.automations.base import AutomationJob
-from pioreactor.automations.events import UpdatedHeaterDC
 from pioreactor.calibrations.registry import CalibrationProtocol
 from pioreactor.calibrations.session_flow import fields
 from pioreactor.calibrations.session_flow import SessionContext
@@ -62,7 +64,7 @@ __plugin_author__ = "Pioreactor"
 __plugin_summary__ = (
     "Replaces temperature automation with FIR MLX/ambient/PCB estimation and thermostat bias trim."
 )
-__plugin_version__ = "0.2.12"
+__plugin_version__ = "0.2.14"
 
 
 TEMPERATURE_FIR_DEVICE = "temperature_fir"
@@ -162,6 +164,9 @@ class TemperatureAutomationJobFIR(AutomationJob):
             {"datatype": "float", "settable": False, "unit": "%"},
         )
 
+        self._exit_event = Event()
+        self._heater_state_lock = RLock()
+
         if not hardware.is_heating_pcb_present():
             self.logger.error("Heating PCB must be attached to Pioreactor HAT")
             self.clean_up()
@@ -170,63 +175,69 @@ class TemperatureAutomationJobFIR(AutomationJob):
         self._sample_period_s = config.getfloat("temperature_automation", "sample_period_s", fallback=1.0)
         self._mlx_address = int(config.get("temperature_automation", "mlx_address", fallback="0x3A"), 16)
 
+        # Pausing changes applied power without losing the automation's requested power.
         self.heater_duty_cycle = 0.0
+        self._requested_heater_duty_cycle = 0.0
         self.pwm = self.setup_pwm()
-        self._is_disconnecting = False
 
         self.heating_pcb_tmp_driver = self._setup_heating_pcb_tmp_sensor()
         self.mlx_driver = self._setup_mlx_driver(self._mlx_address)
         self.estimator = self._load_active_fir_estimator()
-        self._volume_ml = config.getfloat("bioreactor", "initial_volume_ml", fallback=25.0)
         self._liquid_temperature_estimate: float | None = None
         self._last_sample_monotonic: float | None = None
 
-        self.subscribe_and_callback(
-            self._update_volume_from_mqtt,
-            [
-                f"pioreactor/{self.unit}/{self.experiment}/dosing_automation/current_volume_ml",
-                f"pioreactor/{self.unit}/{self.experiment}/bioreactor/current_volume_ml",
-            ],
-            allow_retained=True,
-        )
+        self.latest_temperature_at = current_utc_datetime()
 
+    def __post__init__(self) -> None:
+        # Timers can execute the automation, so wait until the subclass is initialized.
         self.read_external_temperature_timer = RepeatedTimer(
             20,
             self.read_heating_pcb_temperature,
             job_name=self.job_name,
             run_immediately=False,
             logger=self.logger,
-        ).start()
+        )
 
         self.publish_temperature_timer = RepeatedTimer(
             max(0.25, float(self._sample_period_s)),
             self.infer_temperature,
             job_name=self.job_name,
-            run_immediately=True,
+            # on_init_to_ready supplies the first reading without racing this timer.
+            run_immediately=False,
             logger=self.logger,
-        ).start()
+        )
 
-        self.latest_temperature_at = current_utc_datetime()
+        super().__post__init__()
+        self.read_external_temperature_timer.start()
+        self.publish_temperature_timer.start()
 
-    def on_init_to_ready(self):
+    def on_init_to_ready(self) -> None:
         self.infer_temperature()
 
     def on_disconnected(self) -> None:
-        self._is_disconnecting = True
+        self._exit_event.set()
+        super().on_disconnected()
 
         with suppress(AttributeError):
             self.publish_temperature_timer.cancel()
             self.read_external_temperature_timer.cancel()
 
         with suppress(AttributeError):
-            self.turn_off_heater()
+            with self._heater_state_lock:
+                self.turn_off_heater()
 
     def on_sleeping(self) -> None:
+        super().on_sleeping()
         self.publish_temperature_timer.pause()
-        self._update_heater(0)
+        self._apply_heater()
 
     def on_sleeping_to_ready(self) -> None:
+        super().on_sleeping_to_ready()
         self.publish_temperature_timer.unpause()
+
+    def on_ready(self) -> None:
+        super().on_ready()
+        self._apply_heater()
 
     def _setup_heating_pcb_tmp_sensor(self):
         if whoami.is_testing_env():
@@ -273,15 +284,6 @@ class TemperatureAutomationJobFIR(AutomationJob):
 
         return yaml_decode(estimator_path.read_bytes(), type=FIRTemperatureEstimator)
 
-    def _update_volume_from_mqtt(self, message: pt.MQTTMessage) -> None:
-        if not message.payload:
-            return
-
-        try:
-            self._volume_ml = float(message.payload)
-        except (TypeError, ValueError):
-            self.logger.debug("Ignoring invalid current_volume_ml payload: %r", message.payload)
-
     def setup_pwm(self) -> PWM:
         heater_channel = hardware.get_heater_pwm_channel()
         pin = hardware.get_pwm_to_pin_map()[heater_channel]
@@ -314,20 +316,35 @@ class TemperatureAutomationJobFIR(AutomationJob):
         return False
 
     def update_heater_with_delta(self, delta_duty_cycle: float) -> bool:
-        return self.update_heater(self.heater_duty_cycle + delta_duty_cycle)
+        with self._heater_state_lock:
+            return self.update_heater(self._requested_heater_duty_cycle + delta_duty_cycle)
 
     def _update_heater(self, new_duty_cycle: float) -> bool:
+        with self._heater_state_lock:
+            self._requested_heater_duty_cycle = clamp(0.0, round(float(new_duty_cycle), 2), 100.0)
+            return self._apply_heater()
 
-        if self.pwm._is_cleaned_up:
+    def _apply_heater(self) -> bool:
+        # Continuous FIR sensing does not require turning off the heater for inference.
+        with self._heater_state_lock:
+            heater_may_run = (
+                self.state in (self.INIT, self.READY)
+                and not self._shutdown_started
+                and not self._exit_event.is_set()
+            )
+            return self._set_heater_pwm(self._requested_heater_duty_cycle if heater_may_run else 0.0)
+
+    def _set_heater_pwm(self, duty_cycle: float) -> bool:
+        if self.pwm.is_cleaned_up:
             return False
 
-        requested_duty_cycle = clamp(0.0, round(float(new_duty_cycle), 2), 100.0)
-
-        if self._is_disconnecting and requested_duty_cycle > 0.0:
-            return False
-
-        self.heater_duty_cycle = requested_duty_cycle
-        self.pwm.change_duty_cycle(self.heater_duty_cycle)
+        self.heater_duty_cycle = duty_cycle
+        try:
+            self.pwm.change_duty_cycle(self.heater_duty_cycle)
+        except (ValueError, exc.PWMError):
+            if self.pwm.is_cleaned_up:
+                return False
+            raise
 
         if self.heater_duty_cycle == 0.0:
             with local_intermittent_storage("temperature_and_heating") as cache:
@@ -378,7 +395,10 @@ class TemperatureAutomationJobFIR(AutomationJob):
             self.logger.debug(
                 f"Temperature of heating surface exceeded {self.MAX_TEMP_TO_REDUCE_HEATING}℃ (currently {temp}℃). Reducing heater slightly."
             )
-            self._update_heater(self.heater_duty_cycle * DANGER_ZONE_DUTY_CYCLE_REDUCTION_FACTOR)
+            with self._heater_state_lock:
+                self._update_heater(
+                    self._requested_heater_duty_cycle * DANGER_ZONE_DUTY_CYCLE_REDUCTION_FACTOR
+                )
 
         return temp
 
@@ -404,7 +424,8 @@ class TemperatureAutomationJobFIR(AutomationJob):
         self, mlx_object_temp: float, mlx_ambient_temp: float, pcb_temp: float
     ) -> float:
         est = self.estimator
-        volume_correction = est.k_vol * (self._volume_ml - est.volume_ref_ml)
+        volume_ml = bioreactor.get_bioreactor_value(self.experiment, "current_volume_ml")
+        volume_correction = est.k_vol * (volume_ml - est.volume_ref_ml)
         return (
             est.w_obj * mlx_object_temp
             + est.w_amb * mlx_ambient_temp
@@ -466,10 +487,10 @@ class TemperatureAutomationJobFIR(AutomationJob):
         self.latest_temperature = temperature.temperature
         self.latest_temperature_at = temperature.timestamp
 
-        if not self._is_disconnecting and (self.state == self.READY or self.state == self.INIT):
-            self.latest_event = self.execute()
+        if self.state == self.READY or self.state == self.INIT:
+            self.run_once(wait_for_ready=False, allowed_states=(self.READY, self.INIT))
 
-    def execute(self):
+    def execute(self) -> structs.AutomationEvent | None:
         return None
 
 
@@ -502,7 +523,7 @@ class Thermostat(TemperatureAutomationJobFIR):
 
         self.set_target_temperature(target_temperature)
 
-    def on_init_to_ready(self):
+    def on_init_to_ready(self) -> None:
         super().on_init_to_ready()
         if not is_pio_job_running("stirring"):
             self.logger.warning("It's recommended to have stirring on when using the thermostat.")
@@ -524,29 +545,18 @@ class Thermostat(TemperatureAutomationJobFIR):
         self.target_temperature = self._clamp_target_temperature(target_temperature)
         self.pid.set_setpoint(self.target_temperature)
 
-    def execute(self):
-        while not hasattr(self, "pid") and self.state is self.READY:
-            pass
-
+    def execute(self) -> None:
         assert self.latest_temperature is not None
         output = self.pid.update(self.latest_temperature, dt=self._sample_period_s)
         self.update_heater_with_delta(output)
 
-        return UpdatedHeaterDC(
-            f"delta_dc={output}",
-            data={
-                "current_dc": self.heater_duty_cycle,
-                "delta_dc": output,
-                "target_temperature": self.target_temperature,
-                "latest_temperature": self.latest_temperature,
-            },
-        )
+        return
 
 
 class OnlyRecordTemperature(TemperatureAutomationJobFIR):
     automation_name = "only_record_temperature"
 
-    def execute(self):
+    def execute(self) -> None:
         return None
 
 

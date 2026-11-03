@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import sys
+from threading import RLock
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -23,7 +24,8 @@ def test_compute_unlagged_temperature_includes_volume_and_bias() -> None:
         volume_ref_ml=25.0,
         user_bias_c=-0.3,
     )
-    job._volume_ml = 30.0
+    job.experiment = "test_compute_unlagged_temperature_includes_volume_and_bias"
+    fta.bioreactor.set_bioreactor_value(job.experiment, "current_volume_ml", 30.0)
 
     result = job._compute_unlagged_temperature(mlx_object_temp=40.0, mlx_ambient_temp=20.0, pcb_temp=30.0)
 
@@ -158,19 +160,24 @@ def test_setup_mlx_driver_raises_clear_error_when_address_missing(
     assert "MLX90632 not found at address 0x3A" in str(e.value)
 
 
-def test_update_volume_from_mqtt_ignores_invalid_payloads() -> None:
+def test_compute_unlagged_temperature_uses_current_persisted_volume() -> None:
     job: Any = object.__new__(fta.TemperatureAutomationJobFIR)
-    job._volume_ml = 25.0
-    job.logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
+    job.experiment = "test_compute_unlagged_temperature_uses_current_persisted_volume"
+    job.estimator = SimpleNamespace(
+        w_obj=1.0,
+        w_amb=0.0,
+        w_pcb=0.0,
+        c=0.0,
+        k_vol=0.1,
+        volume_ref_ml=25.0,
+        user_bias_c=0.0,
+    )
 
-    job._update_volume_from_mqtt(SimpleNamespace(payload="31.5"))
-    assert job._volume_ml == pytest.approx(31.5)
+    fta.bioreactor.set_bioreactor_value(job.experiment, "current_volume_ml", 30.0)
+    assert job._compute_unlagged_temperature(37.0, 24.0, 25.0) == pytest.approx(37.5)
 
-    job._update_volume_from_mqtt(SimpleNamespace(payload="not-a-number"))
-    assert job._volume_ml == pytest.approx(31.5)
-
-    job._update_volume_from_mqtt(SimpleNamespace(payload=None))
-    assert job._volume_ml == pytest.approx(31.5)
+    fta.bioreactor.set_bioreactor_value(job.experiment, "current_volume_ml", 20.0)
+    assert job._compute_unlagged_temperature(37.0, 24.0, 25.0) == pytest.approx(36.5)
 
 
 def test_compute_window_slope_returns_endpoint_slope_for_linear_history() -> None:
@@ -425,6 +432,8 @@ def test_check_if_exceeds_max_temp_reduces_heater_gently_in_danger_zone(
 
     job: Any = object.__new__(fta.TemperatureAutomationJobFIR)
     job.heater_duty_cycle = 80.0
+    job._requested_heater_duty_cycle = 80.0
+    job._heater_state_lock = RLock()
     job.logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
     reductions: list[float] = []
 

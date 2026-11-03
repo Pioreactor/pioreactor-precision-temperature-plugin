@@ -32,6 +32,10 @@ def _write_test_config(dot_pioreactor: Path) -> None:
             ui_log_file={logs_dir / "ui.log"}
             console_log_level=DEBUG
 
+            [storage]
+            persistent_cache={dot_pioreactor / "persistent.sqlite"}
+            temporary_cache={dot_pioreactor / "temporary.sqlite"}
+
             [stirring.config]
             initial_target_rpm=400
 
@@ -150,4 +154,6 @@ os.environ["DOT_PIOREACTOR"] = str(_dot_pioreactor)
 os.environ["GLOBAL_CONFIG"] = str(_dot_pioreactor / "config.ini")
 os.environ["LOCAL_CONFIG"] = str(_dot_pioreactor / "unit_config.ini")
 os.environ["TESTING"] = "1"
+os.environ["MODEL_NAME"] = "pioreactor_40ml_XR"
+os.environ["MODEL_VERSION"] = "1.5"
 _install_runtime_stubs()
