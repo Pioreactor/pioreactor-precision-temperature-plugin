@@ -41,3 +41,30 @@ This plugin vendors Adafruit's `adafruit_mlx90632.py` source from:
 
 License text is included at:
 `pioreactor_precision_temperature_plugin/THIRD_PARTY_LICENSE_ADAFRUIT_MLX90632.txt`
+
+## One-point temperature trim
+
+Use the usual vial, liquid volume, stir bar, and external temperature probe.
+Enter the target temperature and continue. Heating and stirring start, and the
+waiting page advances automatically when the estimate is stable. Abort remains
+available throughout the wait. Keep this page open while it checks progress.
+
+The estimate must remain within ±0.15°C of the target for two continuous minutes,
+checked approximately every five seconds.
+Leaving the band resets the timer; slope and total variation within the band do
+not affect acceptance.
+
+Duplicate or stale readings cannot establish stability. Missing readings or gaps
+longer than 15 seconds restart the window. The wait fails after 90 minutes and
+requests shutdown of the jobs started by this session.
+
+Once stable, heating and stirring continue while you enter the settled external
+probe reading. Continue checks the current sensor reading, saves a new estimator,
+and stops the session's jobs. Submission never returns to the waiting page.
+If the current reading is stale or outside the target range, the form keeps your
+input and explains why the trim cannot be saved. Repeated trims add
+the measured correction to the existing estimator bias.
+
+This flow requires the core and frontend changes that add `steps.wait()`; update
+both alongside the plugin. Stability thresholds are initial engineering defaults,
+informed by recent cluster temperature data, and still need physical validation.

@@ -180,130 +180,89 @@ def test_compute_unlagged_temperature_uses_current_persisted_volume() -> None:
     assert job._compute_unlagged_temperature(37.0, 24.0, 25.0) == pytest.approx(36.5)
 
 
-def test_compute_window_slope_returns_endpoint_slope_for_linear_history() -> None:
-    history = [
-        {"ts": 540.0, "temperature": 33.0},
-        {"ts": 570.0, "temperature": 35.5},
-        {"ts": 600.0, "temperature": 38.0},
-    ]
-
-    slope = fta._compute_window_slope_c_per_min(history)
-    expected = (38.0 - 33.0) / ((600.0 - 540.0) / 60.0)
-    assert slope == pytest.approx(expected)
-    assert math.isinf(fta._compute_window_slope_c_per_min([]))
-
-
-def test_compute_window_slope_uses_linear_regression() -> None:
-    history = [
-        {"ts": 0.0, "temperature": 36.99},
-        {"ts": 10.0, "temperature": 37.02},
-        {"ts": 20.0, "temperature": 37.01},
-        {"ts": 30.0, "temperature": 37.02},
-    ]
-
-    assert fta._compute_window_slope_c_per_min(history) == pytest.approx(0.048)
-
-
-def test_check_once_accepts_stable_window_and_uses_median(monkeypatch: pytest.MonkeyPatch) -> None:
-    temperatures = [37.00, 37.01, 37.00, 37.02, 37.01, 37.00, 37.01]
-    readings = iter(SimpleNamespace(temperature=value) for value in temperatures)
-    sleep_calls: list[float] = []
-    now_values = iter(1000.0 + index * 5.0 for index in range(len(temperatures)))
-
-    monkeypatch.setattr(fta, "_fetch_current_temperature", lambda *_args, **_kwargs: next(readings, None))
-    monkeypatch.setattr(fta.time, "sleep", lambda seconds: sleep_calls.append(seconds))
-    monkeypatch.setattr(fta, "_now_ts", lambda: next(now_values))
-
-    session = SimpleNamespace(status="in_progress", error=None, step_id="stabilize")
-    ctx: Any = SimpleNamespace(
+def trim_context() -> Any:
+    return SimpleNamespace(
         data={
             "unit": "unit-test",
             "experiment": "exp-test",
             "target_temperature": 37.0,
-            "stability_history": [],
-            "stabilization_started_at_ts": 900.0,
-        },
-        session=session,
-    )
-
-    result = fta.BiasTrimStabilizeStep()._check_once(ctx)
-
-    assert result is True
-    assert sleep_calls == [fta.STABILIZATION_SAMPLE_INTERVAL_S] * 6
-    assert float(ctx.data["stable_temperature_estimate"]) == pytest.approx(37.01)
-    assert float(ctx.data["stabilization_window_range_c"]) == pytest.approx(0.02)
-
-
-def test_check_once_accepts_flat_window_with_moderate_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
-    temperatures = [36.97, 37.04, 36.98, 37.035, 36.98, 37.04, 36.97]
-    readings = iter(SimpleNamespace(temperature=value) for value in temperatures)
-    now_values = iter(1000.0 + index * 5.0 for index in range(len(temperatures)))
-
-    monkeypatch.setattr(fta, "_fetch_current_temperature", lambda *_args, **_kwargs: next(readings, None))
-    monkeypatch.setattr(fta.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(fta, "_now_ts", lambda: next(now_values))
-
-    ctx: Any = SimpleNamespace(
-        data={
-            "unit": "unit-test",
-            "experiment": "exp-test",
-            "target_temperature": 37.0,
-            "stabilization_started_at_ts": 900.0,
+            "stabilization_started_at_ts": 1000.0,
         },
         session=SimpleNamespace(status="in_progress", error=None, step_id="stabilize"),
     )
 
-    assert fta.BiasTrimStabilizeStep()._check_once(ctx) is True
-    assert bool(ctx.data["stabilization_range_ok"]) is True
-    assert float(ctx.data["stabilization_window_range_c"]) == pytest.approx(0.07)
 
+def poll_temperature(
+    monkeypatch: pytest.MonkeyPatch, ctx: Any, timestamp: float, temperature: float, age: float = 0.0
+) -> bool:
+    from datetime import datetime, timezone
 
-def test_check_once_rejects_rising_window_near_upper_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
-    temperatures = [37.02, 37.03, 37.04, 37.05, 37.06, 37.07, 37.08]
-    readings = iter(SimpleNamespace(temperature=value) for value in temperatures)
-    now_values = iter(1000.0 + index * 5.0 for index in range(len(temperatures)))
-
-    monkeypatch.setattr(fta, "_fetch_current_temperature", lambda *_args, **_kwargs: next(readings, None))
-    monkeypatch.setattr(fta.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(fta, "_now_ts", lambda: next(now_values))
-
-    ctx: Any = SimpleNamespace(
-        data={
-            "unit": "unit-test",
-            "experiment": "exp-test",
-            "target_temperature": 37.0,
-            "stabilization_started_at_ts": 900.0,
-        },
-        session=SimpleNamespace(status="in_progress", error=None, step_id="stabilize"),
+    monkeypatch.setattr(fta, "_now_ts", lambda: timestamp + age)
+    monkeypatch.setattr(
+        fta,
+        "_fetch_current_temperature",
+        lambda *_args: SimpleNamespace(
+            temperature=temperature, timestamp=datetime.fromtimestamp(timestamp, timezone.utc)
+        ),
     )
-
-    assert fta.BiasTrimStabilizeStep()._check_once(ctx) is False
-    assert bool(ctx.data["stabilization_upper_headroom_ok"]) is False
-    assert "rising" in str(ctx.data["stabilization_status_message"]).lower()
+    return fta.BiasTrimStabilizeStep()._check_once(ctx)
 
 
-def test_check_once_rejects_excessive_window_range(monkeypatch: pytest.MonkeyPatch) -> None:
-    temperatures = [36.95, 37.04, 36.96, 37.03, 36.97, 37.02, 36.98]
-    readings = iter(SimpleNamespace(temperature=value) for value in temperatures)
-    now_values = iter(1000.0 + index * 5.0 for index in range(len(temperatures)))
+def test_stability_requires_full_window_of_fresh_samples(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = trim_context()
+    for index in range(24):
+        assert not poll_temperature(monkeypatch, ctx, 1000 + index * 5, 37 + (index % 2) * 0.01)
+    assert poll_temperature(monkeypatch, ctx, 1120, 37.0)
+    assert ctx.data["stable_temperature_estimate"] == pytest.approx(37.0)
+    assert ctx.session.status == "in_progress"  # control stays on for the probe
 
-    monkeypatch.setattr(fta, "_fetch_current_temperature", lambda *_args, **_kwargs: next(readings, None))
-    monkeypatch.setattr(fta.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(fta, "_now_ts", lambda: next(now_values))
 
-    ctx: Any = SimpleNamespace(
-        data={
-            "unit": "unit-test",
-            "experiment": "exp-test",
-            "target_temperature": 37.0,
-            "stabilization_started_at_ts": 900.0,
-        },
-        session=SimpleNamespace(status="in_progress", error=None, step_id="stabilize"),
-    )
+@pytest.mark.parametrize(
+    "temperatures",
+    [
+        [36.96 + i * 0.003 for i in range(25)],  # drift is allowed within the target band
+        [36.94, 37.06] * 12 + [36.94],  # variation is allowed within the target band
+    ],
+)
+def test_hold_accepts_movement_within_target_band(
+    monkeypatch: pytest.MonkeyPatch, temperatures: list[float]
+) -> None:
+    ctx = trim_context()
+    for index, temperature in enumerate(temperatures[:-1]):
+        assert not poll_temperature(monkeypatch, ctx, 1000 + index * 5, temperature)
+    assert poll_temperature(monkeypatch, ctx, 1120, temperatures[-1])
 
-    assert fta.BiasTrimStabilizeStep()._check_once(ctx) is False
-    assert bool(ctx.data["stabilization_range_ok"]) is False
-    assert "varying" in str(ctx.data["stabilization_status_message"]).lower()
+
+def test_retained_and_missing_readings_cannot_complete_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = trim_context()
+    assert not poll_temperature(monkeypatch, ctx, 1000, 37.0)
+    assert not poll_temperature(monkeypatch, ctx, 1000, 37.0, age=5)
+    assert len(ctx.data["stability_history"]) == 1
+    assert not poll_temperature(monkeypatch, ctx, 1000, 37.0, age=20)
+    assert ctx.data["stability_history"] == []
+    assert not poll_temperature(monkeypatch, ctx, 1025, 37.0)
+    assert not poll_temperature(monkeypatch, ctx, 1050, 37.0)
+    assert len(ctx.data["stability_history"]) == 1
+
+
+@pytest.mark.parametrize("temperature,age", [(float("nan"), 0), (37.0, -1)])
+def test_invalid_readings_reset_stability(
+    monkeypatch: pytest.MonkeyPatch, temperature: float, age: float
+) -> None:
+    ctx = trim_context()
+    assert not poll_temperature(monkeypatch, ctx, 1000, temperature, age)
+    assert not ctx.data["is_stable"]
+
+
+def test_timeout_applies_even_without_sensor_readings(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = trim_context()
+    monkeypatch.setattr(fta, "_now_ts", lambda: 1000 + fta.STABILIZATION_TIMEOUT_S)
+    stopped: list[dict] = []
+    monkeypatch.setattr(fta, "_stop_bias_trim_jobs", lambda data: stopped.append(data))
+    assert fta.BiasTrimStabilizeStep().advance(ctx) is None
+    assert ctx.session.status == "failed"
+    assert ctx.session.step_id == "ended"
+    assert len(stopped) == 1
 
 
 def test_mark_failed_and_stop_sets_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -449,9 +408,13 @@ def test_check_if_exceeds_max_temp_reduces_heater_gently_in_danger_zone(
     assert reductions == [pytest.approx(80.0 * fta.DANGER_ZONE_DUTY_CYCLE_REDUCTION_FACTOR)]
 
 
-def test_bias_trim_probe_step_ui_uses_store_estimator(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("stable_estimate", [37.0, 36.89])
+def test_bias_trim_probe_step_ui_uses_store_estimator(
+    monkeypatch: pytest.MonkeyPatch, stable_estimate: float
+) -> None:
     base = SimpleNamespace(
         estimator_name="baseline-estimator",
+        user_bias_c=0.2,
         w_obj=0.6,
         w_amb=0.2,
         w_pcb=0.1,
@@ -464,6 +427,16 @@ def test_bias_trim_probe_step_ui_uses_store_estimator(monkeypatch: pytest.Monkey
     monkeypatch.setattr(fta, "_load_active_fir_estimator", lambda: base)
     monkeypatch.setattr(fta, "_default_bias_trim_name", lambda _name: "trimmed-estimator")
     monkeypatch.setattr(fta, "get_unit_name", lambda: "unit-test")
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(fta, "_now_ts", lambda: 1100.0)
+    monkeypatch.setattr(
+        fta,
+        "_fetch_current_temperature",
+        lambda *_args: SimpleNamespace(
+            temperature=37.02, timestamp=datetime.fromtimestamp(1100, timezone.utc)
+        ),
+    )
     monkeypatch.setattr(fta, "current_utc_datetime", lambda: "2020-01-01T00:00:00Z")
 
     class FakeAdjustedEstimator:
@@ -494,7 +467,13 @@ def test_bias_trim_probe_step_ui_uses_store_estimator(monkeypatch: pytest.Monkey
 
     ctx: Any = SimpleNamespace(
         mode="ui",
-        data={"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"},
+        data={
+            "stable_temperature_estimate": stable_estimate,
+            "job_source": "bias-trim-123",
+            "unit": "unit-test",
+            "experiment": "exp-test",
+            "target_temperature": 37.0,
+        },
         inputs=SimpleNamespace(float=lambda _key: 37.4),
         store_estimator=fake_store_estimator,
         complete=lambda payload: completed.update(payload),
@@ -509,8 +488,8 @@ def test_bias_trim_probe_step_ui_uses_store_estimator(monkeypatch: pytest.Monkey
     assert completed["saved_path"] == "/tmp/ui-estimator.yaml"
     assert completed["estimator_name"] == "trimmed-estimator"
     assert completed["base_estimator_name"] == "baseline-estimator"
-    assert completed["user_bias_c"] == pytest.approx(0.4)
-    assert stopped_data == [{"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"}]
+    assert completed["user_bias_c"] == pytest.approx(0.58)
+    assert stopped_data == [ctx.data]
 
 
 def test_bias_trim_probe_step_uses_store_estimator_even_if_mode_cli(
@@ -518,6 +497,7 @@ def test_bias_trim_probe_step_uses_store_estimator_even_if_mode_cli(
 ) -> None:
     base = SimpleNamespace(
         estimator_name="baseline-estimator",
+        user_bias_c=0.2,
         w_obj=0.6,
         w_amb=0.2,
         w_pcb=0.1,
@@ -530,6 +510,16 @@ def test_bias_trim_probe_step_uses_store_estimator_even_if_mode_cli(
     monkeypatch.setattr(fta, "_load_active_fir_estimator", lambda: base)
     monkeypatch.setattr(fta, "_default_bias_trim_name", lambda _name: "trimmed-estimator")
     monkeypatch.setattr(fta, "get_unit_name", lambda: "unit-test")
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(fta, "_now_ts", lambda: 1100.0)
+    monkeypatch.setattr(
+        fta,
+        "_fetch_current_temperature",
+        lambda *_args: SimpleNamespace(
+            temperature=37.02, timestamp=datetime.fromtimestamp(1100, timezone.utc)
+        ),
+    )
     monkeypatch.setattr(fta, "current_utc_datetime", lambda: "2020-01-01T00:00:00Z")
 
     class FakeAdjustedEstimator:
@@ -554,7 +544,13 @@ def test_bias_trim_probe_step_uses_store_estimator_even_if_mode_cli(
 
     ctx: Any = SimpleNamespace(
         mode="cli",
-        data={"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"},
+        data={
+            "stable_temperature_estimate": 37.0,
+            "job_source": "bias-trim-123",
+            "unit": "unit-test",
+            "experiment": "exp-test",
+            "target_temperature": 37.0,
+        },
         inputs=SimpleNamespace(float=lambda _key: 37.4),
         store_estimator=fake_store_estimator,
         complete=lambda payload: completed.update(payload),
@@ -569,5 +565,95 @@ def test_bias_trim_probe_step_uses_store_estimator_even_if_mode_cli(
     assert completed["saved_path"] == "/tmp/cli-estimator.yaml"
     assert completed["estimator_name"] == "trimmed-estimator"
     assert completed["base_estimator_name"] == "baseline-estimator"
-    assert completed["user_bias_c"] == pytest.approx(0.4)
-    assert stopped_data == [{"stable_temperature_estimate": 37.0, "job_source": "bias-trim-123"}]
+    assert completed["user_bias_c"] == pytest.approx(0.58)
+    assert stopped_data == [ctx.data]
+
+
+def test_probe_outside_target_range_stays_on_form(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = trim_context()
+    ctx.session.step_id = "probe"
+    ctx.data["stable_temperature_estimate"] = 37.0
+    ctx.inputs = SimpleNamespace(float=lambda _key: 37.4)
+    poll_temperature(monkeypatch, ctx, 1000, 37.3)
+    with pytest.raises(ValueError, match="outside the target range"):
+        fta.BiasTrimProbeStep().advance(ctx)
+    assert ctx.session.step_id == "probe"
+    assert ctx.inputs.float("measured_temperature") == 37.4
+
+
+def test_real_session_waits_then_prompts_without_stopping_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pioreactor.calibrations.session_flow import advance_session, get_session_step
+
+    monkeypatch.setattr(fta, "_start_bias_trim_stirring", lambda _id: "source")
+    monkeypatch.setattr(fta, "_start_bias_trim_heating", lambda _id, _target: "source")
+    monkeypatch.setattr(fta, "_stop_bias_trim_jobs", lambda _data: pytest.fail("Stopped before measurement"))
+    monkeypatch.setattr(fta, "_now_ts", lambda: 1000.0)
+    session = fta.start_fir_temperature_bias_trim_session(fta.TEMPERATURE_FIR_DEVICE)
+    registry = fta.FIRTemperatureBiasTrimProtocol.step_registry
+    advance_session(registry, session, {})
+    advance_session(registry, session, {"target_temperature": 37.0})
+    assert get_session_step(registry, session).step_type == "wait"
+    for index in range(25):
+        from datetime import datetime, timezone
+
+        timestamp = 1000 + index * 5
+        monkeypatch.setattr(fta, "_now_ts", lambda: timestamp)
+        monkeypatch.setattr(
+            fta,
+            "_fetch_current_temperature",
+            lambda *_args: SimpleNamespace(
+                temperature=37.0, timestamp=datetime.fromtimestamp(timestamp, timezone.utc)
+            ),
+        )
+        advance_session(registry, session, {})
+    assert session.step_id == "probe"
+    assert get_session_step(registry, session).step_type == "form"
+
+
+def test_probe_rejects_stale_reading_without_saving(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = trim_context()
+    ctx.inputs = SimpleNamespace(float=lambda _key: 37.4)
+    poll_temperature(monkeypatch, ctx, 1000, 37.0, age=30)
+    with pytest.raises(ValueError, match="No fresh temperature"):
+        fta.BiasTrimProbeStep().advance(ctx)
+
+
+def test_stop_request_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fta, "_unit_api_address", lambda: "localhost")
+    monkeypatch.setattr(fta, "post_into", lambda *args, **kwargs: SimpleNamespace(ok=False, status_code=500))
+    with pytest.raises(ValueError, match="Unable to stop trim jobs"):
+        fta._stop_bias_trim_jobs({"job_source": "trim-session"})
+
+
+def test_timeout_remains_terminal_if_cleanup_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = trim_context()
+
+    def fail_cleanup(data: Any) -> None:
+        raise ValueError("Worker unavailable")
+
+    monkeypatch.setattr(fta, "_stop_bias_trim_jobs", fail_cleanup)
+    fta._mark_failed_and_stop(ctx, "Timed out")
+    assert ctx.session.status == "failed"
+    assert ctx.session.error == "Timed out Cleanup failed: Worker unavailable"
+
+
+@pytest.mark.parametrize("outside_temperature", [36.84, 37.16])
+def test_leaving_target_band_restarts_entire_hold(
+    monkeypatch: pytest.MonkeyPatch, outside_temperature: float
+) -> None:
+    ctx = trim_context()
+    for index in range(24):
+        assert not poll_temperature(monkeypatch, ctx, 1000 + index * 5, 37.0)
+    assert not poll_temperature(monkeypatch, ctx, 1120, outside_temperature)
+    assert ctx.data["stability_history"] == []
+    for index in range(24):
+        assert not poll_temperature(monkeypatch, ctx, 1125 + index * 5, 37.0)
+    assert poll_temperature(monkeypatch, ctx, 1245, 37.0)
+
+
+@pytest.mark.parametrize("temperature", [36.85, 37.15])
+def test_hold_includes_target_band_boundaries(monkeypatch: pytest.MonkeyPatch, temperature: float) -> None:
+    ctx = trim_context()
+    for index in range(24):
+        assert not poll_temperature(monkeypatch, ctx, 1000 + index * 5, temperature)
+    assert poll_temperature(monkeypatch, ctx, 1120, temperature)

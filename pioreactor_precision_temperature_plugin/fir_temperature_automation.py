@@ -36,6 +36,7 @@ from pioreactor.calibrations.session_flow import SessionStep
 from pioreactor.calibrations.session_flow import StepRegistry
 from pioreactor.calibrations.session_flow import steps
 from pioreactor.calibrations.structured_session import CalibrationSession
+from pioreactor.calibrations.structured_session import CalibrationStep
 from pioreactor.calibrations.structured_session import utc_iso_timestamp
 from pioreactor.config import config
 from pioreactor.estimators import ESTIMATOR_PATH
@@ -69,12 +70,10 @@ __plugin_version__ = "0.2.14"
 
 TEMPERATURE_FIR_DEVICE = "temperature_fir"
 
-STABILIZATION_TARGET_ERROR_C = 0.1
-STABILIZATION_MAX_SLOPE_C_PER_MIN = 0.02
-STABILIZATION_WINDOW_S = 30.0
+STABILIZATION_TARGET_ERROR_C = 0.15
+STABILIZATION_WINDOW_S = 120.0
 STABILIZATION_SAMPLE_INTERVAL_S = 5.0
-STABILIZATION_MAX_RANGE_C = 0.08
-STABILIZATION_RISING_UPPER_HEADROOM_C = 0.03
+STABILIZATION_MAX_SAMPLE_GAP_S = 15.0
 STABILIZATION_TIMEOUT_S = 90 * 60
 DANGER_ZONE_DUTY_CYCLE_REDUCTION_FACTOR = 0.9965
 
@@ -683,13 +682,14 @@ def _start_bias_trim_stirring(session_id: str) -> str:
 
 
 def _stop_job_by_source(job_source: str) -> None:
-    with suppress(Exception):
-        post_into(
-            _unit_api_address(),
-            "/unit_api/jobs/stop",
-            json={"job_source": job_source},
-            timeout=8,
-        )
+    response = post_into(
+        _unit_api_address(),
+        "/unit_api/jobs/stop",
+        json={"job_source": job_source},
+        timeout=8,
+    )
+    if not response.ok:
+        raise ValueError(f"Unable to stop trim jobs: {response.status_code}")
 
 
 def _stop_bias_trim_jobs(data: t.Mapping[str, t.Any]) -> None:
@@ -713,69 +713,37 @@ def _now_ts() -> float:
     return current_utc_datetime().timestamp()
 
 
-def _compute_window_slope_c_per_min(history_window: list[dict[str, float]]) -> float:
-    if len(history_window) < 2:
-        return float("inf")
-
-    mean_ts = sum(row["ts"] for row in history_window) / len(history_window)
-    mean_temperature = sum(row["temperature"] for row in history_window) / len(history_window)
-    variance_ts = sum((row["ts"] - mean_ts) ** 2 for row in history_window)
-    if variance_ts <= 0:
-        return float("inf")
-
-    covariance = sum(
-        (row["ts"] - mean_ts) * (row["temperature"] - mean_temperature) for row in history_window
-    )
-    return (covariance / variance_ts) * 60.0
-
-
 def _update_stabilization_state(
     ctx: SessionContext, history: list[dict[str, float]], target_temperature: float
 ) -> None:
-    temperatures = [row["temperature"] for row in history]
-    latest_temperature = temperatures[-1]
-    latest_abs_error = abs(latest_temperature - target_temperature)
-    slope_c_per_min = _compute_window_slope_c_per_min(history)
-    all_errors_ok = all(
-        abs(temperature - target_temperature) <= STABILIZATION_TARGET_ERROR_C for temperature in temperatures
-    )
-    slope_ok = math.isfinite(slope_c_per_min) and abs(slope_c_per_min) <= STABILIZATION_MAX_SLOPE_C_PER_MIN
-    window_range_c = max(temperatures) - min(temperatures)
-    range_ok = window_range_c <= STABILIZATION_MAX_RANGE_C
-    upper_headroom_ok = not (
-        slope_c_per_min > 0
-        and latest_temperature > target_temperature + STABILIZATION_RISING_UPPER_HEADROOM_C
-    )
-    is_stable = all_errors_ok and slope_ok and range_ok and upper_headroom_ok
+    latest_temperature = history[-1]["temperature"]
+    lower = target_temperature - STABILIZATION_TARGET_ERROR_C
+    upper = target_temperature + STABILIZATION_TARGET_ERROR_C
+    # Only uninterrupted in-range observations contribute to the hold time.
+    if not all(lower <= row["temperature"] <= upper for row in history):
+        history = []
+    elapsed = history[-1]["ts"] - history[0]["ts"] if history else 0.0
+    is_stable = elapsed >= STABILIZATION_WINDOW_S
 
     if is_stable:
-        status_message = "Temperature passed the 30-second stability check."
-    elif not upper_headroom_ok:
-        status_message = "Temperature is still rising near the upper limit. Wait before checking again."
-    elif latest_temperature > target_temperature + STABILIZATION_TARGET_ERROR_C:
-        status_message = "Temperature is above the target. Wait for it to return before checking again."
-    elif not range_ok:
-        status_message = "Temperature is near the target but still varying. Wait before checking again."
-    elif slope_c_per_min > STABILIZATION_MAX_SLOPE_C_PER_MIN:
-        status_message = "Temperature is still warming. Wait before checking again."
+        status_message = "Temperature has remained within the target range for two minutes."
+    elif not history:
+        status_message = "Waiting for the temperature to reach the target range."
     else:
-        status_message = "Temperature is not yet within the target range. Wait before checking again."
+        status_message = "Holding near the target. This page advances automatically after two minutes."
 
     ctx.data["stability_history"] = history
     ctx.data["latest_estimated_temperature"] = latest_temperature
-    ctx.data["latest_abs_error"] = latest_abs_error
-    ctx.data["latest_slope_c_per_min"] = slope_c_per_min
-    ctx.data["stabilization_error_ok"] = all_errors_ok
-    ctx.data["stabilization_slope_ok"] = slope_ok
-    ctx.data["stabilization_range_ok"] = range_ok
-    ctx.data["stabilization_upper_headroom_ok"] = upper_headroom_ok
-    ctx.data["stabilization_window_range_c"] = window_range_c
+    ctx.data["latest_abs_error"] = abs(latest_temperature - target_temperature)
     ctx.data["stabilization_status_message"] = status_message
     ctx.data["is_stable"] = is_stable
 
 
 def _mark_failed_and_stop(ctx: SessionContext, error_message: str) -> None:
-    _stop_bias_trim_jobs(ctx.data)
+    try:
+        _stop_bias_trim_jobs(ctx.data)
+    except Exception as exc:
+        error_message += f" Cleanup failed: {exc}"
     ctx.session.status = "failed"
     ctx.session.error = error_message
     ctx.session.step_id = "ended"
@@ -811,20 +779,20 @@ def start_fir_temperature_bias_trim_session(target_device: str) -> CalibrationSe
 class BiasTrimIntroStep(SessionStep):
     step_id = "intro"
 
-    def render(self, ctx: SessionContext):
+    def render(self, ctx: SessionContext) -> CalibrationStep:
         return steps.info(
             "FIR temperature bias trim",
             "This flow runs thermostat control to a target temperature, waits for stabilization, and then computes a single-point user bias from your probe reading.",
         )
 
-    def advance(self, ctx: SessionContext):
+    def advance(self, ctx: SessionContext) -> SessionStep | None:
         return BiasTrimTargetStep()
 
 
 class BiasTrimTargetStep(SessionStep):
     step_id = "target"
 
-    def render(self, ctx: SessionContext):
+    def render(self, ctx: SessionContext) -> CalibrationStep:
         default_target = float(ctx.data.get("target_temperature", 37.0))
         max_target = get_pioreactor_model().max_temp_to_reduce_heating
         return steps.form(
@@ -841,7 +809,7 @@ class BiasTrimTargetStep(SessionStep):
             ],
         )
 
-    def advance(self, ctx: SessionContext):
+    def advance(self, ctx: SessionContext) -> SessionStep | None:
         target_temperature = ctx.inputs.float("target_temperature")
         ctx.data["target_temperature"] = target_temperature
 
@@ -866,29 +834,29 @@ class BiasTrimTargetStep(SessionStep):
 class BiasTrimStabilizeStep(SessionStep):
     step_id = "stabilize"
 
-    def render(self, ctx: SessionContext):
+    def render(self, ctx: SessionContext) -> CalibrationStep:
         target_temperature = float(ctx.data.get("target_temperature", 37.0))
         latest = ctx.data.get("latest_estimated_temperature")
         latest_error = ctx.data.get("latest_abs_error")
-        latest_slope = ctx.data.get("latest_slope_c_per_min")
         status_message = ctx.data.get("stabilization_status_message")
 
         status_lines = [
-            f"Waiting for stabilization near {target_temperature:.2f}℃. Each check takes about 30 seconds.",
+            f"Waiting for a stable temperature near {target_temperature:.2f}℃. This may take a few minutes.",
+            "The estimate must stay within ±0.15℃ of the target for two continuous minutes. "
+            "Leaving that range restarts the timer.",
         ]
-
         if isinstance(status_message, str):
-            status_lines.append(f"\n{status_message}")
+            status_lines.append(status_message)
         if isinstance(latest, (int, float)):
             status_lines.append(f"Latest estimate: {float(latest):.2f}℃")
         if isinstance(latest_error, (int, float)):
-            status_lines.append(f"Absolute error: {float(latest_error):.2f}℃")
-        if isinstance(latest_slope, (int, float)) and math.isfinite(float(latest_slope)):
-            status_lines.append(f"Rate of change: {float(latest_slope):.2f}℃/min")
+            status_lines.append(f"Distance from target: {float(latest_error):.2f}℃")
 
-        status_lines.append("\nPress Continue to run a stabilization check.")
-
-        step = steps.action("Stabilizing...", "\n".join(status_lines))
+        step = steps.wait(
+            "Waiting for stable temperature",
+            "\n\n".join(status_lines),
+            poll_interval_s=STABILIZATION_SAMPLE_INTERVAL_S,
+        )
 
         step.metadata = {
             "image": {
@@ -901,56 +869,53 @@ class BiasTrimStabilizeStep(SessionStep):
         return step
 
     def _check_once(self, ctx: SessionContext) -> bool:
-        unit = str(ctx.data["unit"])
-        experiment = str(ctx.data["experiment"])
-        target = float(ctx.data["target_temperature"])
-
-        reading = _fetch_current_temperature(unit, experiment)
-        if reading is None:
-            ctx.data["stabilization_status_message"] = (
-                "No temperature reading was available. Check the sensor and try again."
-            )
+        # A reading counts only once, at its sensor timestamp. Retained MQTT
+        # messages must never manufacture a stable window when a sensor stops.
+        now = _now_ts()
+        if now - float(ctx.data["stabilization_started_at_ts"]) >= STABILIZATION_TIMEOUT_S:
+            _mark_failed_and_stop(ctx, "Timed out waiting for stable temperature (90 minutes).")
             return False
 
-        history = [{"ts": _now_ts(), "temperature": reading.temperature}]
-        sample_count = round(STABILIZATION_WINDOW_S / STABILIZATION_SAMPLE_INTERVAL_S)
-        for _ in range(sample_count):
-            time.sleep(STABILIZATION_SAMPLE_INTERVAL_S)
-            reading = _fetch_current_temperature(unit, experiment)
-            if reading is None:
-                ctx.data["stabilization_status_message"] = (
-                    "A temperature reading was missed during the check. Try again."
-                )
-                return False
-            history.append({"ts": _now_ts(), "temperature": reading.temperature})
+        reading = _fetch_current_temperature(str(ctx.data["unit"]), str(ctx.data["experiment"]))
+        now = _now_ts()
+        history = ctx.data.get("stability_history", [])
+        if (
+            reading is None
+            or not math.isfinite(reading.temperature)
+            or not 0 <= now - reading.timestamp.timestamp() <= STABILIZATION_MAX_SAMPLE_GAP_S
+            or reading.timestamp.timestamp() < float(ctx.data["stabilization_started_at_ts"])
+        ):
+            ctx.data["stability_history"] = []
+            ctx.data["is_stable"] = False
+            ctx.data["stabilization_status_message"] = "Waiting for fresh sensor readings."
+            return False
 
-        _update_stabilization_state(ctx, history, target)
-        if bool(ctx.data.get("is_stable", False)):
+        timestamp = reading.timestamp.timestamp()
+        if history and timestamp <= history[-1]["ts"]:
+            return False
+        if history and timestamp - history[-1]["ts"] > STABILIZATION_MAX_SAMPLE_GAP_S:
+            history = []
+        history.append({"ts": timestamp, "temperature": reading.temperature})
+        # Keep the single sample just before the window boundary to prove that
+        # observations span the entire duration, even with polling jitter.
+        while len(history) > 1 and history[1]["ts"] <= timestamp - STABILIZATION_WINDOW_S:
+            history.pop(0)
+        _update_stabilization_state(ctx, history, float(ctx.data["target_temperature"]))
+        if ctx.data["is_stable"]:
             ctx.data["stable_temperature_estimate"] = statistics.median(row["temperature"] for row in history)
             return True
-
-        started_at = ctx.data.get("stabilization_started_at_ts")
-        started = float(started_at) if isinstance(started_at, (int, float)) else _now_ts()
-        if (history[-1]["ts"] - started) > STABILIZATION_TIMEOUT_S:
-            _mark_failed_and_stop(
-                ctx,
-                "Timed out waiting for stabilization (90 minutes). Consider adjusting target temperature and retrying.",
-            )
-            return False
-
         return False
 
-    def advance(self, ctx: SessionContext):
-
+    def advance(self, ctx: SessionContext) -> SessionStep | None:
         if self._check_once(ctx):
             return BiasTrimProbeStep()
-        return BiasTrimStabilizeStep()
+        return None
 
 
 class BiasTrimProbeStep(SessionStep):
     step_id = "probe"
 
-    def render(self, ctx: SessionContext):
+    def render(self, ctx: SessionContext) -> CalibrationStep:
         estimated = float(
             ctx.data.get("stable_temperature_estimate", ctx.data.get("latest_estimated_temperature", 0.0))
         )
@@ -958,16 +923,29 @@ class BiasTrimProbeStep(SessionStep):
             "Enter measured temperature",
             (
                 f"Estimated stabilized temperature is {estimated:.3f}℃. "
-                "Measure liquid temperature with an external probe, then enter that value."
+                "Heating and stirring are still running. Measure the liquid with your external probe, "
+                "then enter its settled reading. Continue saves the trim and stops heating and stirring."
             ),
             [fields.float("measured_temperature", label="Measured temperature (℃)")],
         )
 
-    def advance(self, ctx: SessionContext):
+    def advance(self, ctx: SessionContext) -> SessionStep | None:
         measured_temperature = ctx.inputs.float("measured_temperature")
-        estimated_temperature = float(
-            ctx.data.get("stable_temperature_estimate", ctx.data.get("latest_estimated_temperature", 0.0))
-        )
+        if not math.isfinite(measured_temperature):
+            raise ValueError("Enter a finite measured temperature.")
+        reading = _fetch_current_temperature(str(ctx.data["unit"]), str(ctx.data["experiment"]))
+        if (
+            reading is None
+            or not math.isfinite(reading.temperature)
+            or not 0 <= _now_ts() - reading.timestamp.timestamp() <= STABILIZATION_MAX_SAMPLE_GAP_S
+        ):
+            raise ValueError("No fresh temperature reading. Check the sensor before submitting again.")
+        estimated_temperature = reading.temperature
+        if abs(estimated_temperature - float(ctx.data["target_temperature"])) > STABILIZATION_TARGET_ERROR_C:
+            raise ValueError(
+                f"Current temperature is {estimated_temperature:.2f}℃, outside the target range. "
+                "Your trim has not been saved. Check the temperature before submitting again."
+            )
 
         try:
             base = _load_active_fir_estimator()
@@ -975,7 +953,7 @@ class BiasTrimProbeStep(SessionStep):
             _mark_failed_and_stop(ctx, f"Unable to load active FIR estimator: {e}")
             return None
 
-        user_bias_c = measured_temperature - estimated_temperature
+        user_bias_c = base.user_bias_c + measured_temperature - estimated_temperature
         new_name = _default_bias_trim_name(base.estimator_name)
 
         adjusted = FIRTemperatureEstimator(
@@ -994,6 +972,7 @@ class BiasTrimProbeStep(SessionStep):
         )
 
         try:
+            _stop_bias_trim_jobs(ctx.data)
             save_result = ctx.store_estimator(adjusted, TEMPERATURE_FIR_DEVICE)
             saved_path = save_result["path"]
             if not isinstance(saved_path, str):
@@ -1003,7 +982,6 @@ class BiasTrimProbeStep(SessionStep):
             _mark_failed_and_stop(ctx, f"Unable to save adjusted estimator: {e}")
             return None
 
-        _stop_bias_trim_jobs(ctx.data)
         ctx.complete(
             {
                 "title": "FIR bias trim saved.",
